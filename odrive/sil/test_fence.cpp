@@ -4,12 +4,24 @@
 // The CAN controller is emulated: FakeBus applies each subscription's id/mask filter in
 // software, standing in for the STM32 bxCAN filter banks. Timing, the hardware filter and
 // reset behaviour are therefore NOT tested; only the firmware's dispatch semantics are.
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <variant>
 #include <vector>
 #include "can_simple.hpp"
 #include "odrive_main.h"
+#include "protocol.hpp"  // fibre-cpp: the to_string ODrive's ASCII `r` command uses
+
+// Exactly what `r <float property>` returns: get_string -> to_string(value, buf, 10, 0)
+// (ascii_protocol.cpp:356-357, introspection.hpp:167-168, protocol.hpp:189-191).
+static std::string ascii_read(float v) {
+    char buf[10];
+    to_string(v, buf, sizeof(buf), 0);
+    return buf;
+}
 
 Axis axes[AXIS_COUNT];
 ODriveStub odrv;
@@ -158,6 +170,42 @@ int main() {
     bus.inject(torque(3, 0.7f));
     check(axes[0].controller_.input_torque_ == 0.7f,
           "F9 (expected hazard) after reusing id 3, a stale epoch-0 frame to id 3 is installed");
+
+    // ---- Session-tagged readback (FencedFinality's readback obligation) ----
+    // R1: a session tag in the low mantissa bits cannot be read back over ASCII.
+    float base = 0.37f, lsb = std::nextafter(base, 1.0f);
+    check(ascii_read(base) == ascii_read(lsb), "R1 low-mantissa tag invisible: adjacent floats read back identically");
+
+    // R2: a decimal tag in the 1e-6 digit is lost once the magnitude needs more characters.
+    check(ascii_read(0.123456f) != ascii_read(0.123457f), "R2a below 10 the 1e-6 digit is visible");
+    check(ascii_read(-123.456701f) == ascii_read(-123.456702f),
+          "R2b decimal tag lost at |value| >= 100: readback truncated to 9 characters");
+
+    // R3: paired tag. SET_INPUT_VEL writes input_vel_ (tag) and input_torque_ (value) in one
+    // callback. Tag = session node id + 1. Session node id 9, tag 10.
+    axes[0].config_.can.node_id = 9;
+    cs.service_stack();
+    float pair[2] = {10.0f, 0.37f};
+    bus.inject(frame(9, 0x00D, pair, 8));
+    std::string tag = ascii_read(axes[0].controller_.input_vel_);
+    check(axes[0].controller_.input_torque_ == 0.37f && tag == "10.000000" && std::atof(tag.c_str()) == 10.0f,
+          "R3 SET_INPUT_VEL installs (tag, value) atomically; ASCII readback recovers tag 10 exactly");
+
+    // A stale frame from an earlier session (old id 7, tag 8) cannot overwrite the tag.
+    float stale[2] = {8.0f, 0.99f};
+    bus.inject(frame(7, 0x00D, stale, 8));
+    check(ascii_read(axes[0].controller_.input_vel_) == "10.000000" && axes[0].controller_.input_torque_ == 0.37f,
+          "R3b stale old-session frame to old id leaves tag and value unchanged");
+
+    // R4: every possible tag (node id 0..63 -> tag 1..64) reads back distinctly and exactly.
+    bool tags_ok = true;
+    for (int id = 0; id < 64; ++id) {
+        float t = float(id + 1);
+        std::string s = ascii_read(t);
+        if (std::atof(s.c_str()) != t) tags_ok = false;
+        if (id > 0 && s == ascii_read(float(id))) tags_ok = false;
+    }
+    check(tags_ok, "R4 all 64 tags (node id + 1) round-trip exactly through the 10-char ASCII readback");
 
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL CHECKS AS EXPECTED", failures);
     return failures ? 1 : 0;

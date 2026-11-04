@@ -16,7 +16,9 @@ rev=$(git -C "$odrive" rev-parse HEAD)
 src=$odrive/Firmware/communication/can
 out=$(mktemp -d)
 echo "ODrive $rev"
-sha256sum "$src/can_simple.cpp" "$src/can_simple.hpp" "$src/canbus.hpp" "$src/can_helpers.hpp"
+sha256sum "$src/can_simple.cpp" "$src/can_simple.hpp" "$src/canbus.hpp" "$src/can_helpers.hpp" \
+  "$odrive/Firmware/fibre-cpp/protocol.hpp"
 g++ -std=c++17 -Wall -Wno-unused-parameter -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -I "$here/stubs" -I "$src" "$src/can_simple.cpp" "$here/test_fence.cpp" -o "$out/test_fence"
+  -I "$here/stubs" -I "$src" -I "$odrive/Firmware/fibre-cpp" -I "$odrive/Firmware/fibre-cpp/include" \
+  "$src/can_simple.cpp" "$here/test_fence.cpp" -o "$out/test_fence"
 "$out/test_fence"

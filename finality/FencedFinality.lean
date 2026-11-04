@@ -12,8 +12,9 @@ Gate protocol:
   addressed to the session id;
 * **rotation** is a direct UART write of the drive's node id to the session id;
 * **readback** must confirm the drive's node id is the session id and the committed setpoint was
-  issued in the current session (**session-tagged readback**, an implementation obligation,
-  e.g. a session number encoded in the setpoint's low mantissa bits);
+  issued in the current session (**session-tagged readback**, an implementation obligation.
+  On ODrive 0.5.x: `SET_INPUT_VEL` carries tag = node id + 1 in `input_vel_` alongside the
+  torque, in torque control with passthrough input; see PROOF.md);
 * LEASE_OK = confirmed ∧ the holder's lease is live;
 * **flush** (verified): gate TX abort + drive reset; clears downstream and frees used ids.
 
@@ -451,5 +452,159 @@ theorem reauthorized_with_stuck_frame :
   have r22 := Reach.step r21 (Step.redeem _ ⟨1, 5⟩ (by decide) rfl (by decide))
   have r23 := Reach.step r22 (Step.tick _ true (by intro _; left; decide))
   exact ⟨_, r23, rfl, by decide, rfl, rfl, by decide⟩
+
+
+/-! ## Recoverability: no reachable trap state
+
+From **any** reachable state (stuck frames, exhausted ids, revoked grants, gate never notified),
+a currently valid grant `b` can always be brought back to confirmed control with a live lease,
+given a cooperative environment (the next frame is delivered and committed). This is a
+universal "no trap" property, not fairness-based eventual liveness. -/
+
+theorem step_now {p : Params} {s t : St} (h : Step p s t) : t.now = s.now ∨ t.now = s.now + 1 := by
+  cases h <;> simp [commitState, tickState] <;> split <;> simp
+
+theorem recoverable {p : Params} (hK : 2 ≤ p.K) (hT : 0 < p.T) {s : St} (h : Reach p s) (b : Nat)
+    (hb : s.valid b = true) :
+    ∃ t, Reach p t ∧ t.conf = true ∧ t.holder = some b ∧ t.timer b > 0 := by
+  -- 1. verified flush: no downstream frames, no used ids except the current one
+  have r1 := Reach.step h (Step.flush s)
+  -- 2. pick a fresh id
+  let i : Nat := if s.gid = some 0 then 1 else 0
+  have hiK : i < p.K := by simp only [i]; split <;> omega
+  have hfresh : i ∉ used { s with pend := [], dirty := [] } := by
+    simp only [i, used]
+    cases hg : s.gid with
+    | none => simp
+    | some g => by_cases h0 : g = 0 <;> simp [h0] <;> omega
+  have r2 := Reach.step r1 (Step.switch _ b i hiK hfresh)
+  have r3 := Reach.step r2 (Step.rotate _ i rfl)
+  have r4 := Reach.step r3 (Step.rechallenge _)
+  have r5 := Reach.step r4 (Step.issue _ b (by simpa using hb))
+  have r6 := Reach.step r5 (Step.redeem _ ⟨b, s.chal + 1⟩ (by simp) rfl (by simp))
+  have r7 := Reach.step r6 (Step.reshape _ [b])
+  have r8 := Reach.step r7 (Step.forward _ b i (by simp) rfl (by simp; omega) rfl)
+  have r9 := Reach.step r8 (Step.commit _ ⟨i, s.cur + 1, b⟩ (by simp))
+  have r10 := Reach.step r9 (Step.readback _)
+  exact ⟨_, r10, by simp [commitState], by simp [commitState], by simp [commitState]; omega⟩
+
+/-! ## Clock drift: the cut is timestamped in real time
+
+Real time `rt` advances separately from the gate's tick counter `now`. Gate-clock assumption:
+at most `R` real ticks pass between two gate ticks. The revocation is timestamped `rcut` in real
+time. Every bound inside the gate (`W`, `T`, `δ`) stays in gate ticks. -/
+
+namespace Drift
+
+structure DSt where
+  s     : St
+  rt    : Nat          -- real time
+  since : Nat          -- real ticks since the last gate tick
+  rcut  : Option Nat   -- real time of the revocation
+
+def dinit : DSt := ⟨init, 0, 0, none⟩
+
+inductive DStep (p : Params) (R : Nat) : DSt → DSt → Prop
+  | gate (d : DSt) (t : St) (h : Step p d.s t) :
+      DStep p R d { s := t, rt := d.rt,
+                    since := if t.now = d.s.now + 1 then 0 else d.since,
+                    rcut := if d.s.cutAt = none ∧ t.cutAt ≠ none then some d.rt else d.rcut }
+  | real (d : DSt) (h : d.since + 1 ≤ R) : DStep p R d { d with rt := d.rt + 1, since := d.since + 1 }
+
+inductive DReach (p : Params) (R : Nat) : DSt → Prop
+  | init : DReach p R dinit
+  | step {d e : DSt} : DReach p R d → DStep p R d e → DReach p R e
+
+theorem step_cut_keep {p : Params} {s t : St} (h : Step p s t) {c : Nat} (hc : s.cutAt = some c) :
+    t.cutAt = some c := by
+  cases h with
+  | cut h' => rw [hc] at h'; cases h'
+  | commit x _ => unfold commitState; split <;> simpa using hc
+  | tick o _ => simpa [tickState] using hc
+  | _ => simpa using hc
+
+theorem step_cut_new {p : Params} {s t : St} (h : Step p s t) (hn : s.cutAt = none) :
+    t.cutAt = none ∨ (t.cutAt = some s.now ∧ t.now = s.now) := by
+  cases h with
+  | cut _ => right; simp
+  | commit x _ => left; unfold commitState; split <;> simpa using hn
+  | tick o _ => left; simpa [tickState] using hn
+  | _ => left; simpa using hn
+
+structure DInv (p : Params) (R : Nat) (d : DSt) : Prop where
+  reach : Reach p d.s
+  since : d.since ≤ R
+  sync  : d.s.cutAt = none ↔ d.rcut = none
+  rel   : ∀ c rc, d.s.cutAt = some c → d.rcut = some rc →
+            c ≤ d.s.now ∧ d.rt ≤ rc + R * (d.s.now - c) + d.since
+
+theorem dinv_reach {p : Params} {R : Nat} {d : DSt} (h : DReach p R d) : DInv p R d := by
+  induction h with
+  | init => exact ⟨Reach.init, by simp [dinit], by simp [dinit, init], by simp [dinit, init]⟩
+  | @step d e _ hst ih =>
+    cases hst with
+    | gate t hs =>
+      have hr : Reach p t := Reach.step ih.reach hs
+      by_cases hn : d.s.cutAt = none
+      · rcases step_cut_new hs hn with ht | ⟨ht, hnow⟩
+        · have hrc : d.rcut = none := ih.sync.mp hn
+          refine ⟨hr, ?_, ?_, ?_⟩
+          · have := ih.since; simp only; split <;> omega
+          · simp [ht, hn, hrc]
+          · intro c rc hc; rw [ht] at hc; cases hc
+        · refine ⟨hr, ?_, ?_, ?_⟩
+          · have := ih.since; simp only; split <;> omega
+          · simp [ht, hn]
+          · intro c rc hc hrc
+            simp [ht, hn] at hc hrc
+            subst hc; subst hrc
+            dsimp only
+            refine ⟨by omega, ?_⟩
+            rw [hnow]; omega
+      · obtain ⟨c0, hc0⟩ := Option.ne_none_iff_exists'.mp hn
+        have hkeep := step_cut_keep hs hc0
+        have hrc0 : d.rcut ≠ none := fun h0 => hn (ih.sync.mpr h0)
+        refine ⟨hr, ?_, ?_, ?_⟩
+        · have := ih.since; simp only; split <;> omega
+        · simp [hkeep, hn]; exact hrc0
+        · intro c rc hc hrc
+          simp [hn] at hrc
+          rw [hkeep] at hc; cases hc
+          obtain ⟨hle, hrel⟩ := ih.rel c0 rc hc0 hrc
+          have hsince := ih.since
+          rcases step_now hs with hsame | hplus
+          · dsimp only
+            rw [ite_eq_right (by omega), hsame]
+            exact ⟨hle, hrel⟩
+          · dsimp only
+            rw [ite_eq_left hplus, hplus]
+            refine ⟨by omega, ?_⟩
+            have : R * (d.s.now + 1 - c0) = R * (d.s.now - c0) + R := by
+              rw [show d.s.now + 1 - c0 = (d.s.now - c0) + 1 by omega, Nat.mul_succ]
+            omega
+    | real hR =>
+      exact ⟨ih.reach, by simpa using hR, ih.sync,
+        fun c rc hc hrc => by obtain ⟨h1, h2⟩ := ih.rel c rc hc hrc; exact ⟨h1, by simp; omega⟩⟩
+
+/-- **Finality in real time.** If the gate clock never lets more than `R` real ticks pass
+    between gate ticks, the fenced finality conclusions hold from real time
+    `rcut + R·(W + T + δ + 1)` on. -/
+theorem finality_real {p : Params} {R : Nat} (hR : 1 ≤ R) (hδ : 1 ≤ p.δ) {d : DSt}
+    (h : DReach p R d) {rc : Nat} (hrc : d.rcut = some rc)
+    (hdl : rc + R * (p.W + p.T + p.δ + 1) ≤ d.rt) (hout : d.s.out = true) :
+    d.s.supp ≠ some p.r ∧ d.s.drvSrc ≠ some p.r ∧
+      ∀ x ∈ d.s.pend, x.origin = p.r → x.addr ≠ d.s.nid := by
+  have hi := dinv_reach h
+  obtain ⟨c, hc⟩ := Option.ne_none_iff_exists'.mp (fun h0 => by
+    have := hi.sync.mp h0; rw [hrc] at this; cases this)
+  obtain ⟨hle, hrel⟩ := hi.rel c rc hc hrc
+  have hs := hi.since
+  -- R·(W+T+δ+1) ≤ R·(now - c) + R, hence W+T+δ ≤ now - c
+  have hmul : R * (p.W + p.T + p.δ + 1) ≤ R * (d.s.now - c + 1) := by
+    rw [Nat.mul_succ R (d.s.now - c)]; omega
+  have hk : p.W + p.T + p.δ + 1 ≤ d.s.now - c + 1 := Nat.le_of_mul_le_mul_left hmul (by omega)
+  exact finality hδ hi.reach hc (by omega) hout
+
+end Drift
 
 end Fenced

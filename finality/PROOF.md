@@ -290,7 +290,7 @@ Bus-off is not covered; it needs manual fault injection.
 
 ### Composed theorem: fenced timed finality (`FencedFinality.lean`)
 
-Artifact: `FencedFinality.lean` (sha256 `99794e91…`). `lean FencedFinality.lean` produces no
+Artifact: `FencedFinality.lean` (sha256 `854750ac…`). `lean FencedFinality.lean` produces no
 output. Axioms: `propext`, `Quot.sound`.
 
 This composes the timed authority/lease/output model with the finite-id fence and **removes
@@ -320,11 +320,53 @@ output energized at and after the deadline.
 committed setpoint, not only its value.
 - **Why value readback is not enough here:** value equality alone cannot support the
   provenance conclusion after the deadline (`Fence.value_readback_only_breaks`).
-- **A concrete implementation:** the gate encodes the session number in the low mantissa bits
-  of the float setpoint, a negligible ~1e-7 relative perturbation. Readback of
-  `axis0.controller.input_torque` then reveals the session.
-- **Status:** not yet tested on ODrive. A firmware-side round-trip check belongs in the SIL
-  test.
+- **Correction: the low-mantissa-bit encoding does *not* work on stock ODrive 0.5.x.** ASCII
+  float readback is `snprintf("%f")` into a 10-character buffer (`ascii_protocol.cpp:356-357`,
+  `fibre-cpp/protocol.hpp:189-191`). That is at most 6 decimals, truncated further for larger
+  magnitudes, so float32 low bits (~1e-8) are invisible.
+- **Resolved at code level: paired tag (option b).** Verified in source and SIL; not yet on
+  hardware.
+  - **Mechanism:** the gate runs the drive in `CONTROL_MODE_TORQUE_CONTROL` +
+    `INPUT_MODE_PASSTHROUGH` and sends every setpoint as `SET_INPUT_VEL(input_vel = tag,
+    input_torque = value)`, with **tag = session node id + 1**.
+  - **Why `input_vel_` is free in this mode (source, not executed):** `vel_setpoint_` feeds
+    only `vel_des`, which is used only when `control_mode >= VELOCITY_CONTROL`
+    (`controller.cpp:295, 376`). Torque-mode velocity limiting uses the *config* `vel_limit`
+    (`:388-393`). Other input modes break this: `VEL_RAMP` derives torque from the velocity
+    ramp (`:194-198`).
+  - **Why the tag is unique:** node ids are fresh since the last flush, and boot leaves
+    `input_vel_ = 0`, which never equals a tag.
+  - **Readback must check tag *and* value.** The firmware writes `input_vel_` then
+    `input_torque_` as two stores (`can_simple.cpp:282-283`); the value check closes that gap.
+  - **SIL (real `can_simple.cpp` + real fibre `to_string`):**
+    - R1: low-mantissa tags are unreadable.
+    - R2a/R2b: a decimal tag works below 10 but is lost at |value| ≥ 100.
+    - R3/R3b: the paired tag round-trips; a stale old-session frame to an old id cannot
+      overwrite it.
+    - R4: all 64 tags round-trip exactly through the 10-character readback.
+  - **Rejected alternatives:** low-mantissa tags (R1) and the decimal tag (a), which is
+    magnitude-limited (R2b). A firmware session register (c) is unnecessary on 0.5.x.
+
+### Recoverability and clock drift (also in `FencedFinality.lean`)
+
+| Theorem | Statement |
+|---|---|
+| `Fenced.recoverable` | from **any** reachable state (stuck frames, exhausted ids, revoked grants, gate never notified), any currently valid grant can reach confirmed control with a live lease, given K ≥ 2, T > 0 and a cooperative environment for the next frame. No reachable state is a trap |
+| `Fenced.Drift.finality_real` | real time is separate from gate ticks; at most R real ticks between gate ticks; the revocation is timestamped in real time. The fenced finality conclusions hold from real time `rcut + R·(W + T + δ + 1)` |
+
+`recoverable` is a universal *possibility* result. It is **not** eventual liveness under
+fairness: that would need a trace semantics with fairness assumptions on delivery and is not
+proved. `finality_real` covers a gate clock *slower* than real time, by up to factor R. A
+faster gate clock only makes the real deadline earlier.
+
+### Still not mechanised
+
+- **Exact-effect grant sets** (Actryn): grants are identities for one protected effect. With
+  one gate per effect, the theorems apply per effect. Grant sets with alternate support
+  across effects are not modelled.
+- **Refinement to gate firmware:** no gate firmware exists yet. When it does, its CAN/UART
+  handling should be checked against `Fenced.Step`, as the SIL does for the drive side.
+- **Fairness-based liveness:** see above.
 
 **Rule necessity:** this file proves no counterexamples of its own. Each rule's necessity is
 shown in the component models:

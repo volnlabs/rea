@@ -1,0 +1,5 @@
+-std=c++17
+-Istubs
+-I.odrive-src/Firmware/communication/can
+-I.odrive-src/Firmware/fibre-cpp
+-I.odrive-src/Firmware/fibre-cpp/include
