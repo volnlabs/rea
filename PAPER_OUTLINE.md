@@ -5,7 +5,11 @@ repo. Nothing has been run on motor hardware.
 
 ## Working title
 
-*Revoked but Still Moving: Timed Actuation Finality Requires a Drive-Side Fence*
+*Energy Is Not Authority: Mechanised Timed Finality for Actuator Handover*
+
+The earlier title, "Revoked but Still Moving…", collides with IETF
+draft-das-finality-bound-revocation ("Revoked but Still Executable"). See
+`finality/RELATED_WORK.md`.
 
 ## Thesis (one paragraph)
 
@@ -13,41 +17,58 @@ When a controller's authority is revoked, commands it already issued can still r
 actuator: queued, in flight, stuck in a bus controller, or persisting in the drive's setpoint
 register.
 
-- **Impossibility:** we prove that no gate deciding from what it can observe (forwarded
-  commands, readback, time, any other inputs) can be both safe and live across controller
-  replacement once a command has been lost, unless downstream delivery is bounded or the drive
-  enforces a fence.
-- **Protocol and composed theorem:** we give a fencing protocol (per-session node-id rotation,
-  session-tagged readback, energy interlock, fresh ids with verified flush) and prove a
-  composed timed theorem. After `t_c + W + T + δ`, every energized output is free of the
-  retired authority, in energy, in committed command, and in any command that can still take
-  effect. This holds with unbounded downstream delay, finite ids, and a gate that never hears
-  of the revocation.
-- **Stock hardware:** a stock motor drive (ODrive v3, fw 0.5.x) already contains the needed
-  fence, shown by software-in-the-loop on its unmodified CAN code.
+- **Energy is not authority:** device-side fencing (Chubby sequencers, Raft terms, PROFIsafe
+  sequence numbers, Spot leases) and energy removal (STO) are known. We show that composing
+  them naively is unsafe with persistent setpoints: an energy gate held by the new authority
+  can execute the retired authority's command.
+- **Protocol and composed theorem:** we give a protocol that binds energy to the provenance of
+  the executing command (per-session node-id rotation, session-tagged readback, energy
+  interlock, fresh ids with verified flush). We prove a composed timed theorem: after
+  `t_c + W + T + δ`, every energized output is free of the retired authority, in energy, in
+  committed command, and in any command that can still take effect. This holds with unbounded
+  hidden downstream delay, finite ids, clock drift, and a gate that never hears of the
+  revocation.
+- **Why some fence is unavoidable** (a mechanised form of the known lease-without-fencing
+  limitation): no observation-based gate is safe and live across handover without one.
+- **Stock hardware:** a stock, non-safety motor drive (ODrive v3, fw 0.5.x) can be retrofitted
+  with the needed fence, shown by software-in-the-loop on its unmodified CAN code.
 
 ## Contributions
 
-1. **Impossibility** (`Impossibility.lean`: `stuck_twin`, `lost_frame_blocks`,
-   `no_timeout_helps`), with non-vacuity (`singleGrant_safe`).
-2. **Fenced timed finality** (`FencedFinality.lean`: `finality`, `Drift.finality_real`,
-   `recoverable`). One theorem covers energy support, committed-command provenance and
-   capable pending commands.
+Revised after the related-work check (`finality/RELATED_WORK.md`). The individual mechanisms
+(receiver-side epoch/sequence checks, leases-need-fencing, watchdog to safe state, STO,
+sink fences) are prior art, so the contributions are the composition and its physical
+specifics.
+
+1. **Energy authority is not command authority.** With persistent actuator setpoints, an
+   STO-like energy gate lets a retired controller's command execute under the new authority's
+   lease (setpoint hijack). The gate must bind energy to the provenance of the command being
+   executed (`Product.Counterexamples.command_bypass`, `no_filter`; `GateRefinement`
+   commit-boundary counterexamples).
+2. **A mechanised, composed timed bound to physical quiescence**, `FencedFinality.lean`:
+   - `finality`: energy support, committed command and still-capable pending commands are all
+     free of the retired authority after `t_c + W + T + δ`;
+   - `Drift.finality_real`: the same in real time with gate clock drift;
+   - `recoverable`: no trap states;
+   - assumptions: unbounded hidden downstream delay, a finite fence namespace with verified
+     flush, a gate that may never hear of the cut.
 3. **Minimality.** Every protocol rule has a counterexample when dropped:
-   - setpoint hijack under a power-only gate,
+   - setpoint hijack,
    - stale token replay,
    - authority rollback,
    - id reuse,
    - unverified flush,
    - value-only readback,
-   - bypass of the power or command path.
-
-   This separates the design from "a safety MCU plus sequence numbers".
-4. **Grounding in real artifacts:**
-   - ODrive fence semantics executed on unmodified firmware (SIL, mutation-checked);
-   - session-tagged readback shown implementable on stock firmware;
-   - static RE of the Raspberry Pi 5 RP1 showing why the host platform cannot be the
-     finality point.
+   - power or command bypass.
+4. **Retrofit on a stock, non-safety drive.**
+   - ODrive's CAN node-id dispatch repurposed as an epoch fence;
+   - paired-tag session readback;
+   - both executed by SIL on unmodified firmware (mutation-checked).
+5. **Supporting result, not a headline:** a mechanised statement of the known
+   lease-without-fencing limitation for hidden commits (`Impossibility.lean`). Cite Chubby
+   §2.4 lock-delay, Kleppmann 2016, and Santos-Grueiro arXiv 2609.02866 as closest.
+6. **Platform evidence:** static RE of the Raspberry Pi 5 RP1 showing why the host platform
+   cannot be the finality point.
 
 ## Section plan
 
@@ -56,7 +77,7 @@ register.
 | 1 | Problem: revocation vs persistent/queued physical effects; acceptance ≠ effect | brief; `rp1-fw/AXIOMOS-IMPLICATIONS.md` |
 | 2 | System model: authority service, gate, downstream, drive, output stage; threat model (retired domain keeps upstream access) | `FencedFinality.lean` `Step` |
 | 3 | Why the host platform cannot be the boundary (Pi 5 RP1: no ownership, outputs persist through host/PCIe failure, revocation path = failure path) | `rp1-fw/RP1_*.md` |
-| 4 | Impossibility without a downstream bound or fence | `Impossibility.lean` §Impossible |
+| 4 | Why some fence is unavoidable (mechanised lease-without-fencing limitation; cite Chubby, Kleppmann, Santos-Grueiro) | `Impossibility.lean` §Impossible |
 | 5 | Fencing protocol and composed theorem; clock drift; recoverability | `FencedFinality.lean` |
 | 6 | Necessity of each rule (counterexample table) | `FinalityProduct`, `GateRefinement`, `FiniteFence`, `Impossibility` §Fence |
 | 7 | Realisation on ODrive v3: node-id fence, filter-renewal window, paired-tag readback, EN_GATE interlock | `odrive/`, `odrive/sil/` |
@@ -113,7 +134,7 @@ Evidence types:
 
 | Criterion | Status |
 |---|---|
-| A plain reference monitor + sequence numbers proves the same | **Not triggered.** C1 shows any observation-based monitor fails without a fence or bound; C6 shows the power-only safety MCU fails |
+| A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. See `finality/RELATED_WORK.md` |
 | The device cannot expose a defensible finality point | Pi 5 RP1: **triggered**. ODrive v3: **not triggered** (C8, C9), but δ (C13) is unbounded in the datasheet |
 | No better than a safety-MCU baseline | **Not triggered in proofs** (C6); needs X3 (C18) on hardware |
 
