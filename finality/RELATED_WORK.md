@@ -46,6 +46,9 @@ What survives is the **composition and its physical specifics** (§ "What remain
 | Santos-Grueiro, *When Does Authorization End? Effect Closure at Provider Boundaries*, arXiv 2609.02866 (Sep 2026) | preprint, abstract verified | "Effect closure"; EFFECTBOUND returns a strategy, an **impossibility certificate**, or no verdict for providers with hidden state; Kafka: "all fixed-set brokers had applied the revocation, yet an earlier authorized request could still append" | **Very close in spirit** to `stuck_twin` / `lost_frame_blocks`: impossibility from hidden downstream state | Software providers; per-instance certificates rather than a general theorem over all gate policies; no physical output, energy path or timing bound |
 | Zhu & Wang, *Authorization Revocation for Long-Running AI Agents: Root-Scoped Quiescence…*, arXiv 2609.21284 (Sep 2026) | preprint, abstract verified | Root-epoch cuts, fences of "old-root expansion and protected sinks"; late already-scheduled effects rejected with cut-plus-fence but not with cancellation alone | Authority epochs + sink fences + alternate support (the brief already lists this as **not novel** on its own) | No physical actuation, no timing bound |
 | Das, *Revoked but Still Executable: … Finality-Bound Revocation*, IETF draft-das-finality-bound-revocation-00 (16 Sep 2026) | individual draft, verified | Revocation bound to the protected commit point, via a monotonic "Revocation Generation"; re-evaluate at dequeue/final commit; "Wall-clock timestamps are not sufficient when revocation and effectuation race." | Commit-point binding, generations, queue re-evaluation | Not a time bound; no physical actuation protocol; no mechanised proof. **Its title collides with our working title.** |
+| CIP Safety (ODVA) ownership / TUNID / SNN | vendor docs via search summaries (Rockwell page returned 403), **not verified** in primary text | A safety I/O device has a **configuration owner** (originator), identified by safety network number + target unit network id. Re-binding to a new owner requires the CIP **Safety Reset** service or **Reset Ownership** back to out-of-box state | **Closest handover analogue:** ownership ≈ our session holder; reset-and-re-own ≈ our verified flush + fresh id | Handover is a procedural re-commissioning through reset, not a protocol with a stated time bound; I found no statement about a previous owner's in-flight messages or persistent motion setpoints |
+| FSoE (Safety over EtherCAT, ETG.5100) | vendor docs, partly verified (Synapticon) | Point-to-point master–slave connection carrying "a connection ID for identifying the connection"; on a missed watchdog "the safe state (STO) is triggered"; safety data runs "in the same EtherCAT frame as the standard process data". Vendor note: re-integration after a master change is implementation-dependent | Connection id + watchdog → STO ≈ fence + lease + energy interlock | Fixed point-to-point connection; master change not specified in what I read |
+| openSAFETY (SADR, SCM) | vendor glossary only | Safety node addresses within a safety domain, managed by a safety configuration manager | — | No handover semantics found |
 | CAN identifier randomisation / ID-hopping (e.g. Humayed & Luo; Karray et al., 2018) | peer-reviewed (not read in full) | Rotating or randomising CAN message ids against spoofing, replay and reverse engineering | Id rotation as a mechanism | Security against attackers, not authority fencing; does not address stale *legitimate* frames from a retired controller |
 
 ## What remains defensible
@@ -58,10 +61,18 @@ None of the items below is established yet. Each is a claim to test in the paper
    power-only, STO-like gate lets a retired controller's command execute under the new
    authority's lease) and the `Fenced.finality` conclusion are about the **interaction** of
    energy authority and command provenance.
-   - **Not found in:** STO, PROFIsafe (1:1, no handover), Spot docs, or the software
-     revocation preprints.
-   - **Confidence:** moderate. Not checked: FSoE / CIP Safety / openSAFETY and the IEC
-     61784-3 normative text.
+   - **Safety fieldbuses (PROFIsafe, FSoE, CIP Safety)** fence and watchdog the *safety
+     channel*, which carries STO and safety I/O.
+     - FSoE safety data rides "in the same EtherCAT frame as the standard process data"
+       (verified).
+     - **Inference, not verified:** the motion setpoints themselves are standard, non-safety
+       process data with no authority fencing.
+     - If that holds, an industrial drive after controller handover is exactly the hijack
+       configuration: energy enabled by the safety channel, setpoint from an unfenced channel.
+   - **Not found in:** STO, PROFIsafe (1:1), FSoE (point-to-point), CIP Safety (ownership by
+     reset), Spot docs, or the software revocation preprints.
+   - **Confidence:** moderate. The setpoint-channel inference needs a drive manual or the
+     ETG/ODVA specification.
 2. **A mechanised, composed timed bound to physical quiescence.** The bound covers authority
    service → gate → untrusted downstream with hidden commits → finite-namespace fence with
    verified flush → energy interlock → output stage. It holds with clock drift and a gate that
@@ -74,6 +85,20 @@ None of the items below is established yet. Each is a claim to test in the paper
    Practical and specific, but **an engineering contribution**, not a conceptual one.
 4. **Finite fence namespace with verified flush** (`FiniteFence`). The "K − 1 replacements
    between flushes" result is simple; useful for completeness, weak as a headline.
+
+**An honest limit on availability claims.** Our protocol also passes through an **energy-off
+interval** at every handover: a switch clears confirmation, so LEASE_OK stays low until rotation,
+commit and readback complete. It is therefore a bounded *pause-and-replace*, like CIP Safety's
+ownership reset and like the brief's own "pause-and-replace controller update" baseline.
+
+Its advantages over reset-based re-ownership are:
+- no drive reset while fresh ids remain (K − 1 handovers between flushes);
+- a provenance guarantee for the *setpoint* channel, not only the safety channel;
+- a machine-checked time bound.
+
+Do not claim bumpless handover. Brief kill criterion 3 ("no tighter bound or better
+availability than a safety-MCU baseline") must be tested against an ownership-reset baseline on
+hardware.
 
 ## Consequences for the paper
 
@@ -93,10 +118,14 @@ None of the items below is established yet. Each is a claim to test in the paper
 
 ## Search gaps (not done)
 
-- **Standards:** IEC 61784-3 normative clauses; FSoE, CIP Safety, openSAFETY handover
-  behaviour (do any support re-binding a device to a new controller, and with what
-  guarantees?).
-- **Spot:** behaviour of running commands and persistent effort on lease revocation.
+- **Standards:** IEC 61784-3 normative clauses; ETG.5100 (FSoE) master change; ODVA CIP Safety
+  ownership-transfer guarantees for in-flight messages. Searched 2026-11-05: CIP Safety supports
+  re-ownership via reset; FSoE leaves master change to the implementation; nothing found for
+  openSAFETY.
+- **Drive manuals:** whether drives carry motion setpoints only as standard process data (the
+  hijack-configuration inference above).
+- **Spot:** behaviour of running commands and persistent effort on lease revocation. Searched;
+  only business and policy coverage found.
 - **Formal methods:** TLA+ or Coq/Lean work on lease + fencing (e.g. verified lock services),
   and Gray & Cheriton (SOSP 1989) leases.
 - **Robotics/CPS:** controller-handover or Simplex work with authority semantics (the brief's
@@ -117,3 +146,6 @@ None of the items below is established yet. Each is a claim to test in the paper
 - Zhu & Wang, arXiv 2609.21284: <https://arxiv.org/abs/2609.21284>
 - Das, IETF draft: <https://datatracker.ietf.org/doc/html/draft-das-finality-bound-revocation-00>
 - CAN id randomisation: <https://www.ittc.ku.edu/~bluo/pubs/p19-Humayed.pdf>, <https://rd.springer.com/chapter/10.1007/978-3-319-98935-8_11>
+- CIP Safety ownership/TUNID (vendor): <https://www.rockwellautomation.com/en-fi/docs/technical/logix5000/_online/1756-rm012/guardlogix-5580-and-compact-guardlogix-5580-safety/safety-i-o/safety-i-o-configuration-variations.html> (403 when fetched), <https://download.sew-eurodrive.com/download/html/31985165/en-EN/4222267303555538347403.html>, <https://download.sew-eurodrive.com/download/html/33955921/en-EN/4222281703563322839947.html>
+- FSoE: <https://www.synapticon.com/en/motion-control-academy/fsoe-functional-safety-over-ethercat>, <https://ethercat.org/download/documents/Safety-over-EtherCAT_Introduction.pdf>, <https://webhelp.kollmorgen.com/AKD2G/English/Content/AKD2G-S%20Install/e/fsm/Keywords/AXISx.SAFE.FSOE/AXISx.SAFE.FSOE.LASTERROR.htm>
+- openSAFETY glossary: <https://product-help.schneider-electric.com/Machine%20Expert/V2.2/en/SafeLog/SafeLog/D-SE-0068000.html>
