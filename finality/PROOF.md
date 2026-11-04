@@ -288,6 +288,51 @@ against source (`--selftest` passes).
 
 Bus-off is not covered; it needs manual fault injection.
 
+### Composed theorem: fenced timed finality (`FencedFinality.lean`)
+
+Artifact: `FencedFinality.lean` (sha256 `99794e91…`). `lean FencedFinality.lean` produces no
+output. Axioms: `propext`, `Quot.sound`.
+
+This composes the timed authority/lease/output model with the finite-id fence and **removes
+`GateRefinement`'s downstream bound `Dd`**. Ticks are unconditional, and forwarded frames may
+be lost, reordered or stuck forever. The gate may never learn of the revocation, and upstream
+is adversarial.
+
+**Theorem `Fenced.finality`.** From `t_c + W + T + δ` on, an energized output has:
+- energy support ≠ r,
+- committed-setpoint provenance ≠ r, and
+- **no pending r-command addressed to the drive's current id**, i.e. none that can still commit.
+
+Stale r-frames addressed to retired ids may stay downstream forever; they are harmless.
+`reauthorized_with_stuck_frame` (non-vacuity): with an r-frame stuck forever, grant 1 holds the
+output energized at and after the deadline.
+
+**Protocol modelled:**
+- **Sessions:** the gate serves one grant per session. Switching grants starts a session with
+  a fresh node id (unused since the last flush), or an exhausted session.
+- **Forwarding:** only the holder's commands, only while its lease is live, addressed to the
+  session id.
+- **Rotation:** a direct UART write of the drive's node id.
+- **Verified flush:** clears downstream and frees used ids.
+- **LEASE_OK** = confirmed readback ∧ the holder's lease is live.
+
+**New assumption: session-tagged readback.** Readback must identify the *session* of the
+committed setpoint, not only its value.
+- **Why value readback is not enough here:** value equality alone cannot support the
+  provenance conclusion after the deadline (`Fence.value_readback_only_breaks`).
+- **A concrete implementation:** the gate encodes the session number in the low mantissa bits
+  of the float setpoint, a negligible ~1e-7 relative perturbation. Readback of
+  `axis0.controller.input_torque` then reveals the session.
+- **Status:** not yet tested on ODrive. A firmware-side round-trip check belongs in the SIL
+  test.
+
+**Rule necessity:** this file proves no counterexamples of its own. Each rule's necessity is
+shown in the component models:
+- fresh ids and verified flush: `FiniteFence`;
+- authority-side rules: `FinalityProduct`;
+- command filter and exclusivity: `FinalityProduct`, `Refine`;
+- a fence or bound at all: `Impossibility`.
+
 ### Software-in-the-loop check of the fence (`../odrive/sil/`), run
 
 This compiles ODrive's **unmodified** `communication/can/can_simple.cpp` (commit `3a2e4dd1`,
@@ -327,9 +372,8 @@ clone running 0.5.x.
   *possible*. They are not liveness guarantees. Eventual re-authorization under fair
   executions would need explicit fairness and delivery assumptions for the new authority's
   rotation, setpoint and readback. Not proved.
-- `Fence.safe` is **not** a timed-finality theorem. It has no power stage, lease or
-  shutdown delay. Composing it with `FinalityProduct`/`GateRefinement`, replacing the `Dd`
-  assumption with fence confirmation, is not yet done.
+- `Fence.safe` alone is **not** a timed-finality theorem. The composition is now
+  `FencedFinality.finality` (above), under the additional session-tagged readback assumption.
 - The `Refine` counterexamples violate the bookkeeping invariant (`Hijack`). They are not
   energized-output violations. The `Product` counterexamples are output-level.
 
