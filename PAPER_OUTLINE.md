@@ -114,6 +114,7 @@ Evidence types:
 | C16 | Authenticated, unforgeable tokens; unpredictable challenges | A | crypto obligation (abstracted) |
 | C17 | Fence holds on real CAN hardware and timing | O | `odrive/bench/fence_bench.py`, needs board |
 | C18 | Hijack physically observable with a power-only gate and absent with the full gate | O | X3, needs bench |
+| C19 | Multikernel Linux (master `bca8ae161fa6`) can re-lease a PCI function before the retired kernel's CPUs are confirmed stopped, so stale MMIO reaches the device under the new lease; the finality bound does not depend on Multikernel cut latency | S | `finality/MULTIKERNEL.md`; QEMU repro pending |
 
 ## Threats to validity (state up front)
 
