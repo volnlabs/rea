@@ -115,6 +115,7 @@ Evidence types:
 | C17 | Fence holds on real CAN hardware and timing | O | `odrive/bench/fence_bench.py`, needs board |
 | C18 | Hijack physically observable with a power-only gate and absent with the full gate | O | X3, needs bench |
 | C19 | Multikernel Linux (master `bca8ae161fa6`) can re-lease a PCI function before the retired kernel's CPUs are confirmed stopped, so stale MMIO reaches the device under the new lease; the finality bound does not depend on Multikernel cut latency | S | `finality/MULTIKERNEL.md`; QEMU repro pending |
+| C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
 ## Threats to validity (state up front)
 

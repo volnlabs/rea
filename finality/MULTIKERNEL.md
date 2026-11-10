@@ -87,6 +87,51 @@ Status: static reading only. Reproducible on QEMU `virt` (GICv3, ITS) or x86 wit
 virtio/e1000 function, a spinning MMIO writer with IRQs masked, force halt, and a re-grant to the
 second instance.
 
+## Gap 2: a deferred config write from an old incarnation lands on the new lease
+
+This is the finite-fence id-reuse failure (`FiniteFence.reuse_breaks`) in kernel form.
+
+- **No generation in the identity.** Instance ids are reused across re-spawns (`kernfs.c:281-291`),
+  and `struct mk_message` (`multikernel.h:256`) has no generation or epoch field.
+  `mk_instance_start` (`core.c:440`) clears the rings, but that does not help with work the host has
+  already accepted.
+- **A miss defers.** On a fast-path miss, `mk_pciback_request` (`pciback.c:392`) defers the request
+  to a workqueue. The fast path misses whenever the lease has already ended.
+- **The lookup trusts the payload.** At run time, `mk_pciback_work_fn` (`pciback.c:348`) re-resolves
+  the target by the payload's self-asserted `sender_instance_id` and the BDF. The ring-identified
+  sender (`from` in `mk_pciback_msg_handler`) is ignored.
+- **The trace:**
+  1. Incarnation 1 of instance N writes the Command register while halting.
+  2. Its lease ends, so the request is deferred.
+  3. N re-spawns, and incarnation 2 is lent the function.
+  4. The worker runs and applies incarnation 1's write under incarnation 2's lease, then sends the
+     ACK to incarnation 2. That ACK can match a pending request with the same `seq`.
+- **The window:** workqueue latency (normally milliseconds) against re-spawn latency. That is a
+  hidden-delay race and is unbounded under workqueue stalls.
+
+**You already fixed this** in `d83cf0024f4f` ("retire admitted PCI requests before instance reuse":
+pin the exact grant at admission, revoke under the registry lock, serialise against reset). It is part
+of PR multikernel/linux#41, which is OPEN, `CONFLICTING`, and has no reviews. Upstream's lease rework
+(3–4 Nov) rewrote `pciback.c` and reintroduced the old shape. Two fixes would survive the rework:
+
+- pin the `mk_pciback_dev` (or lease) at admission instead of re-resolving it by id;
+- use the ring-identified `from` instead of the payload id.
+
+## Could a Multikernel instance be the guardian (replace the MCU)?
+
+No. Every gate obligation fails on shared hardware:
+
+| Gate obligation | Multikernel instance as guardian |
+|---|---|
+| Exclusive command and energy path (C15) | Actuator outputs (PWM, GPIO) are platform devices, unsupported on arm64; on Pi 5, RP1 is one shared function |
+| Integrity against the controller domain | Containment against stray pointers only: pool memory is removed from the host's direct map (`mem.c:708`). Any kernel can still map any physical address; there is no stage-2/EPT |
+| δ independent of the replaced domain | The host owns the GIC distributor and the ITS; spawn MSIs are mapped by the host over the ring with a timeout (`its_proxy.c:319`) |
+| Survives reset of the controller's machine | Same SoC reset and power domain. RP1 outputs persist through a host reset (`rp1-fw`) while a CPU-side guardian dies |
+| Bounded timing | No real-time or latency claims in the docs |
+
+A Multikernel guardian would need the gate to sit in the same failure domain it is meant to contain.
+The MCU gate stays.
+
 ## Does Multikernel add anything to the theorem?
 
 - **What it gives:** a concrete realisation of the model's `cut` and `flush` for the *gate's own
@@ -98,3 +143,12 @@ second instance.
   is wedged), no device-side fence, and no physical-output guarantee.
 - The paper should cite it as the **replaceable-domain substrate whose cut latency the theorem does
   not depend on**, not as part of the safety argument.
+
+## Verdict for AxiomOS
+
+| Use | Worth it? |
+|---|---|
+| Replaceable controller or AI domain on x86 / arm64 GICv3 (domain lifecycle experiments, X4 recovery) | **Yes.** It is the brief's "replaceable failure domains" |
+| Platform on Pi 5 | **No.** GICv2, MIP not ITS, RP1 not splittable |
+| Guardian or finality point | **No.** See the table above |
+| Paper evidence | **Yes, as a second case study.** Both gaps are the paper's failure modes (energy ≠ authority; id reuse without verified flush) occurring independently in a real, actively developed kernel. Your fixes are the protocol rules (confirm stop before re-grant; pin the epoch at admission). This strengthens the minimality claim (contribution 3) with a non-robot instance |
