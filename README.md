@@ -12,6 +12,8 @@ output?
 
 Run everything: `./check.sh` (Lean 4.35.0 via elan, python3, g++).
 
+`ARCHITECTURE_REVIEW.md` reviews the AxiomOS brief against this evidence.
+
 `PAPER_OUTLINE.md` maps every claim to its evidence: proved, executed, static, assumed or open.
 
 `rp1-fw/out/` is not committed. Regenerate it with:
