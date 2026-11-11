@@ -74,18 +74,15 @@ A wedged CPU that never confirms is `Impossible.lost_frame_blocks`. The safe pol
 re-lease, which is what `arm64.rst` already says for re-loading the same instance ("cannot be started
 again until the machine is rebooted"). It should hold for **any** lessee.
 
-**Your branch fixes half of this.** `mk/lifecycle-safety-submit-v44` makes
-`mk_instance_settle_halted` return `mk_instance_confirm_parked`'s error and keep resources on failure.
-But it is based on `v7.0-mk4` (2026-10-26) and predates `lease.c`, with 49 upstream Multikernel
-commits since. On rebase:
+**Design lessons for our own domain mechanism:**
 
-- call `mk_instance_fence_devices` only **after** confirmation succeeds;
-- make the child force-halt path wait for confirmation instead of settling at once;
-- make `mk_lease_grant` refuse while any CPU of the previous holder is unconfirmed (FAILED state).
+- end a domain's device grants only **after** its CPUs are confirmed stopped, on every halt path
+  (graceful, forced, voluntary);
+- a grant must refuse while any CPU of the previous holder is unconfirmed, for **any** new holder,
+  not only for a re-load of the same domain;
+- a domain whose stop cannot be confirmed keeps its grants until the machine resets.
 
-Status: static reading only. Reproducible on QEMU `virt` (GICv3, ITS) or x86 with two instances, one
-virtio/e1000 function, a spinning MMIO writer with IRQs masked, force halt, and a re-grant to the
-second instance.
+Status: static reading only.
 
 ## Gap 2: a deferred config write from an old incarnation lands on the new lease
 
@@ -109,13 +106,17 @@ This is the finite-fence id-reuse failure (`FiniteFence.reuse_breaks`) in kernel
 - **The window:** workqueue latency (normally milliseconds) against re-spawn latency. That is a
   hidden-delay race and is unbounded under workqueue stalls.
 
-**You already fixed this** in `d83cf0024f4f` ("retire admitted PCI requests before instance reuse":
-pin the exact grant at admission, revoke under the registry lock, serialise against reset). It is part
-of PR multikernel/linux#41, which is OPEN, `CONFLICTING`, and has no reviews. Upstream's lease rework
-(3–4 Nov) rewrote `pciback.c` and reintroduced the old shape. Two fixes would survive the rework:
+An earlier fix existed (`d83cf0024f4f` in open PR multikernel/linux#41: pin the exact grant at
+admission, revoke under the registry lock, serialise against reset). Upstream's lease rework
+(3–4 Nov) rewrote `pciback.c` and reintroduced the old shape, which shows the rule is easy to lose
+when it is not part of the identity.
 
-- pin the `mk_pciback_dev` (or lease) at admission instead of re-resolving it by id;
-- use the ring-identified `from` instead of the payload id.
+**Design lessons for our own domain mechanism:**
+
+- every domain identity carries a generation, and ids are never reused without one;
+- accepted work pins the grant it was admitted under and is never re-resolved by id later;
+- the sender is whoever the channel identifies, never an id written in the payload;
+- ending a grant is serialised against work already admitted under it.
 
 ## Could a Multikernel instance be the guardian (replace the MCU)?
 
@@ -146,17 +147,38 @@ The MCU gate stays.
 
 ## Verdict for AxiomOS
 
+Decision (2026-11-12): Multikernel Linux is a **reference design** for the domain mechanism AxiomOS
+will build. We do not patch, rebase or upstream it.
+
 | Use | Worth it? |
 |---|---|
-| Replaceable controller or AI domain on x86 / arm64 GICv3 (domain lifecycle experiments, X4 recovery) | **Yes.** It is the brief's "replaceable failure domains" |
+| Reference for our own replaceable controller or AI domain mechanism | **Yes.** It is a working instance of the brief's "replaceable failure domains", and its gaps are the rules ours must have from the start |
 | Platform on Pi 5 | **No.** GICv2, MIP not ITS, RP1 not splittable |
 | Guardian or finality point | **No.** See the table above |
-| Paper evidence | **Yes, as a second case study.** Both gaps are the paper's failure modes (energy ≠ authority; id reuse without verified flush) occurring independently in a real, actively developed kernel. Your fixes are the protocol rules (confirm stop before re-grant; pin the epoch at admission). This strengthens the minimality claim (contribution 3) with a non-robot instance |
+| Paper evidence | **Yes, as a second case study.** Both gaps are the paper's failure modes (energy ≠ authority; id reuse without verified flush) occurring independently in a real, actively developed kernel. The fixes are the protocol rules (confirm stop before re-grant; pin the epoch at admission). This strengthens the minimality claim (contribution 3) with a non-robot instance |
 
-## Fix series (2026-11-11, local only)
+## Design lessons for our own domain mechanism
 
-Branch `mk/lease-finality-v1` in `~/Work/linux-multikernel`, three commits on `bca8ae161fa6`.
-Not pushed, not signed off, not run.
+Collected from both gaps and the residual issues below:
+
+1. **Stop before re-grant.** Device grants end only after the retired domain's CPUs are confirmed
+   stopped. An unconfirmed stop blocks re-grant to anyone until reset.
+2. **Generations in identity.** Domain ids carry a generation; admitted work pins its grant.
+3. **Channel-derived sender.** Never trust an id in a message payload, including in "I have halted"
+   and device hot-remove acknowledgements.
+4. **A timeout is not a revocation.** A hot-add timeout must not free a device the domain may already
+   be using; treat it like an unconfirmed stop.
+5. **Config proxying is not a fence.** While BARs, DMA and interrupts stay direct, only CPU stop (or
+   stage-2 / IOMMU revocation) removes access. Prefer a mechanism that can revoke the mapping.
+6. **Reset is not quiescence.** A function reset can fail or leave outputs driven (RP1). The physical
+   finality point stays at the MCU gate.
+7. **Keep the domain mechanism out of the bound.** None of the above enters `t_c + W + T + δ`; these
+   rules buy availability and clean recovery, not safety.
+
+## Fix series (2026-11-11, parked)
+
+Kept as a worked example of lessons 1–3, not as work to continue. Branch `mk/lease-finality-v1` in
+`~/Work/linux-multikernel`, three commits on `bca8ae161fa6`. Not pushed, not signed off, not run.
 
 | Commit | Change |
 |---|---|
@@ -185,7 +207,5 @@ either, so the series adds none. No full kernel link, no arm64 build, no QEMU ru
 - a halt with an unconfirmed CPU now leaves the instance ACTIVE, where it used to become LOADED;
   force halt is the recovery.
 
-**Rebase of PR #41** (47 commits) onto upstream, assessed by per-commit dry-run merges, not done:
-2 apply cleanly, about 10 more show no source conflict in isolation, 2 are superseded (one by
-upstream, `d83cf0024f4f` by this series), and about 30 need manual rework, concentrated in the
-`core.c` settle and shutdown paths, `hotplug.c`, `ipi.c`, `messaging.c` and x86 `spawn.c`.
+**PR #41** (47 commits) was assessed against upstream by per-commit dry-run merges: about 30 need
+manual rework. The rebase is not planned.

@@ -180,4 +180,6 @@ the brief's "alternate support" and "independent support" invariants, which are 
 2. Model make-before-break with alternate support (decides kill criterion 3 in theory).
 3. Phase B hardware: MCU gate with expiring leases, then measure δ and run X3 (setpoint hijack,
    baseline vs fenced), plus a pause-and-replace baseline.
-4. Optional: QEMU reproductions of Multikernel C19/C20 for the second case study.
+4. Carry the Multikernel design lessons (`finality/MULTIKERNEL.md`: stop before re-grant,
+   generations in identity, channel-derived sender) into the design of our own domain mechanism.
+   Multikernel itself is a reference only; we do not patch or upstream it.
