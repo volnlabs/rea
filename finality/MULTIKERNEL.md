@@ -152,3 +152,40 @@ The MCU gate stays.
 | Platform on Pi 5 | **No.** GICv2, MIP not ITS, RP1 not splittable |
 | Guardian or finality point | **No.** See the table above |
 | Paper evidence | **Yes, as a second case study.** Both gaps are the paper's failure modes (energy ≠ authority; id reuse without verified flush) occurring independently in a real, actively developed kernel. Your fixes are the protocol rules (confirm stop before re-grant; pin the epoch at admission). This strengthens the minimality claim (contribution 3) with a non-robot instance |
+
+## Fix series (2026-11-11, local only)
+
+Branch `mk/lease-finality-v1` in `~/Work/linux-multikernel`, three commits on `bca8ae161fa6`.
+Not pushed, not signed off, not run.
+
+| Commit | Change |
+|---|---|
+| `11171d855ba1` | `mk_instance_settle_halted()` confirms the CPUs parked before any lease ends; on failure the instance keeps its leases, so no other instance can be granted the function (closes C19) |
+| `786e945602b8` | `pciback` serves and answers config requests by the ring-identified sender, not the payload id; a miss is answered directly instead of deferred |
+| `808c33ee4692` | a deferred config access pins the lending it was admitted under and is serialised against lease end; queued work for an ended lease does nothing (closes C20) |
+
+Verification of the series found both gaps slightly wider than first read:
+
+- **C19:** a third caller, the voluntary-halt work `mk_halted_work_fn()` (`core.c:1722-1731`), also
+  settled on the instance's word alone.
+- **C20:** the synchronous fast path (`pciback.c:405`) also looked the lending up by the
+  self-asserted id, so any instance could name another's id and reach that instance's functions
+  through the config filter.
+
+**Build:** x86_64, `make W=1 kernel/multikernel/`, gcc 16.2.1: 0 compiler warnings, 0 errors. The
+log has kernel-doc warnings; `core.c` has 11 on the branch and 11 on upstream, `pciback.c` none on
+either, so the series adds none. No full kernel link, no arm64 build, no QEMU run, no lockdep run.
+
+**Left open** (found, not fixed):
+
+- a hot-add timeout or NACK ends the lease although the running instance may already have probed
+  the function (`hotplug.c:1773-1790`);
+- hot-remove ends the lease on the running instance's acknowledgement (`hotplug.c:1871`);
+- `MK_SYS_HALTED` takes the instance id from the payload, not the ring (`core.c:1805`);
+- a halt with an unconfirmed CPU now leaves the instance ACTIVE, where it used to become LOADED;
+  force halt is the recovery.
+
+**Rebase of PR #41** (47 commits) onto upstream, assessed by per-commit dry-run merges, not done:
+2 apply cleanly, about 10 more show no source conflict in isolation, 2 are superseded (one by
+upstream, `d83cf0024f4f` by this series), and about 30 need manual rework, concentrated in the
+`core.c` settle and shutdown paths, `hotplug.c`, `ipi.c`, `messaging.c` and x86 `spawn.c`.
