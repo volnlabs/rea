@@ -96,9 +96,12 @@ Its advantages over reset-based re-ownership are:
 - a provenance guarantee for the *setpoint* channel, not only the safety channel;
 - a machine-checked time bound.
 
-Do not claim bumpless handover. Brief kill criterion 3 ("no tighter bound or better
-availability than a safety-MCU baseline") must be tested against an ownership-reset baseline on
-hardware.
+**Update (make-before-break).** `FencedFinality.lean` now keeps LEASE_OK across a handover from
+a confirmed holder while both leases are live (`bumpless_handover`), and shows the one-lease
+variant is unsafe (`old_lease_alone_breaks`). The claim this supports is narrow: energy can stay
+on across a voluntary handover, with the drive running the previous holder's last setpoint until
+the new holder confirms. Brief kill criterion 3 ("no tighter bound or better availability than a
+safety-MCU baseline") still has to be tested against an ownership-reset baseline on hardware.
 
 ## Consequences for the paper
 

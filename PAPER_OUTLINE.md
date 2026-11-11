@@ -115,6 +115,10 @@ Evidence types:
 | C17 | Fence holds on real CAN hardware and timing | O | `odrive/bench/fence_bench.py`, needs board |
 | C18 | Hijack physically observable with a power-only gate and absent with the full gate | O | X3, needs bench |
 | C19 | Multikernel Linux (master `bca8ae161fa6`) can re-lease a PCI function before the retired kernel's CPUs are confirmed stopped, so stale MMIO reaches the device under the new lease; the finality bound does not depend on Multikernel cut latency | S | `finality/MULTIKERNEL.md`; QEMU repro pending |
+| C21 | Finality holds across gate resets when the challenge and session counters persist and boot flushes; a reset that restarts either counter breaks it | P | `Fenced.finality`, `forgetful_session_reset`, `forgetful_challenge_reset` |
+| C22 | Make-before-break: a handover from a confirmed holder can keep the output energized at every tick while both leases are live; finality still holds | P | `Fenced.bumpless_handover`, `Fenced.finality` (`supp2`) |
+| C23 | Keeping energy on the previous holder's lease alone during a handover is unsafe | P | `Fenced.old_lease_alone_breaks` |
+| C24 | Persistent monotonic challenge and session counters on the gate MCU | A | hardware obligation |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
 ## Threats to validity (state up front)
@@ -138,7 +142,7 @@ Evidence types:
 |---|---|
 | A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. See `finality/RELATED_WORK.md` |
 | The device cannot expose a defensible finality point | Pi 5 RP1: **triggered**. ODrive v3: **not triggered** (C8, C9), but δ (C13) is unbounded in the datasheet |
-| No better than a safety-MCU baseline | **Not triggered in proofs** (C6); needs X3 (C18) on hardware |
+| No better than a safety-MCU baseline | **Not triggered in proofs**: C6 (provenance) and C22 (energy stays on across a handover, which pause-and-replace cannot do). Needs X3 (C18) and a measured handover-overlap success rate on hardware |
 
 ## Evaluation plan (hardware, pending)
 

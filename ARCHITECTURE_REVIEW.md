@@ -28,7 +28,7 @@ baseline.
 | A separate MCU/FPGA is the final gate | A Multikernel instance cannot be the guardian: it shares reset, power, interrupt-controller and physical-memory domains with the domain it must contain (`finality/MULTIKERNEL.md`). Pi 5 RP1 outputs persist through host crash and PCIe loss (`rp1-fw/RP1_RESET_AND_OUTPUT_PERSISTENCE.md`) |
 | PAC-Bayes ranks candidates only after hard admission | Unchanged; out of scope for paper 1 |
 | Kill criteria and required baselines | Sound. Current status in `PAPER_OUTLINE.md` |
-| Phase A: formal counterexamples first | Done in Lean 4 (`finality/`). Four of the five adversarial traces are covered (table below) |
+| Phase A: formal counterexamples first | Done in Lean 4 (`finality/`). All five adversarial traces are covered (table below; the gate-reset trace was added after this review) |
 
 ### Phase A trace coverage
 
@@ -36,7 +36,7 @@ baseline.
 |---|---|
 | Revoked after enqueue, before dequeue | `Fenced.finality` with hidden downstream queue; `Impossible.lost_frame_blocks` |
 | Controller killed after acceptance, before ACK | `GateRefinement` commit boundary; `Refine.no_pending_hijack` |
-| Guardian resets after actuation, before recording completion | **Not modelled.** See change 5 |
+| Guardian resets after actuation, before recording completion | `Step.gateReset` under `Fenced.finality`; `forgetful_session_reset`, `forgetful_challenge_reset` (added after this review) |
 | Persistent PWM energized after controller quiescence | Energy part of `Fenced.finality` (δ obligation); `Finality.lean` Theorem B |
 | Independent authority reauthorizes the same command after the root is cut | `Fenced.reauthorized_with_stuck_frame`; `Product.Counterexamples.command_bypass` |
 
@@ -123,6 +123,10 @@ or state plainly that exact-effect authority is best-effort above the trust root
   boundary.
 
 ### 5. Close two modelling gaps
+
+**Status (2026-11-11): both are now modelled** in `finality/FencedFinality.lean`; see
+`finality/PROOF.md`, "Gate reset and make-before-break handover". The text below is the original
+finding.
 
 **Gate reset (trace 3).** `FencedFinality` has no gate-reset step: its used-id set, challenge counter
 and lease timers never get lost. A gate that reboots and forgets them breaks the fence:

@@ -26,6 +26,17 @@ committed-setpoint provenance ≠ r, and **no pending r-command that can still c
 r-frames addressed to retired ids may stay downstream forever; they are harmless.
 `reauthorized_with_stuck_frame` shows the theorem is not vacuous.
 
+Extensions in this file:
+* **Gate reset** (`gateReset`): leases, holder, confirmation and arming are lost; the challenge
+  and session counters are persistent; boot does the verified flush. `finality` covers it.
+  `forgetful_session_reset` and `forgetful_challenge_reset`: a reset that restarts either
+  counter breaks finality.
+* **Make-before-break handover**: switching away from a confirmed holder keeps LEASE_OK while
+  the previous **and** the new holder's leases are both live, until the new holder is confirmed.
+  `bumpless_handover`: a handover with no de-energized tick. `old_lease_alone_breaks`: keeping
+  energy on the previous holder's lease alone is unsafe. `finality` also bounds `supp2`, the
+  second supporting grant.
+
 Check with: `lean FencedFinality.lean`.
 -/
 
@@ -71,37 +82,61 @@ structure St where
   out     : Bool
   offFor  : Nat
   supp    : Option Nat
+  prev    : Option Nat        -- handover: last confirmed holder, until the new one confirms
+  supp2   : Option Nat        -- ghost: second grant supporting energy during a handover
+  offTicks : Nat              -- ghost: ticks at which LEASE_OK was false
 
 def init : St :=
   { now := 0, valid := fun _ => true, cutAt := none, issued := [], chal := 0, chalAt := 0,
     timer := fun _ => 0, queue := [], cur := 0, holder := none, gid := none, dirty := [], nid := 0,
     pend := [], drvSrc := none, drvSess := none, conf := false, armed := false, out := false,
-    offFor := 0, supp := none }
+    offFor := 0, supp := none, prev := none, supp2 := none, offTicks := 0 }
 
 def used (s : St) : List Nat := match s.gid with
   | some g => g :: s.dirty
   | none => s.dirty
 
-def okAfterTick (s : St) : Bool :=
-  s.conf && (match s.holder with
-             | some g => decide (s.timer g - 1 > 0)
-             | none => false)
+/-- The grant's lease is still live after the coming tick. -/
+def live (s : St) (g : Option Nat) : Bool := match g with
+  | some g => decide (s.timer g - 1 > 0)
+  | none => false
+
+/-- LEASE_OK: the holder's lease is live, and either the holder is confirmed, or a handover is
+    in progress and the previous confirmed holder's lease is **also** live (make-before-break). -/
+def okAfterTick (s : St) : Bool := (s.conf || live s s.prev) && live s s.holder
+
+/-- Readback verdict. -/
+def rb (s : St) : Bool :=
+  decide (s.gid = some s.nid) && decide (s.drvSess = some s.cur) && decide (s.holder ≠ none)
 
 def tickState (s : St) (o : Bool) : St :=
   { s with now := s.now + 1, timer := fun x => s.timer x - 1,
            offFor := if okAfterTick s then 0 else s.offFor + 1,
-           supp := if okAfterTick s then s.holder else s.supp, out := o }
+           supp := if okAfterTick s then s.holder else s.supp,
+           supp2 := if okAfterTick s then (if s.conf then none else s.prev) else s.supp2,
+           offTicks := if okAfterTick s then s.offTicks else s.offTicks + 1, out := o }
 
 def commitState (s : St) (x : DFrame) : St :=
   if x.addr = s.nid then { s with drvSrc := some x.origin, drvSess := some x.sess, pend := s.pend.erase x }
   else { s with pend := s.pend.erase x }
 
+/-- Gate reboot. Volatile state is lost: every lease, the session holder and id, confirmation
+    and arming. The challenge and session counters are **persistent and monotonic**, and boot
+    performs the verified flush before serving anything (so the forgotten used-id set is empty
+    again). `forgetful_session_reset` and `forgetful_challenge_reset` show both are needed. -/
+def resetState (s : St) : St :=
+  { s with timer := fun _ => 0, chal := s.chal + 1, chalAt := s.now, cur := s.cur + 1,
+           holder := none, gid := none, dirty := [], pend := [], conf := false, armed := false,
+           prev := none }
+
 inductive Step (p : Params) : St → St → Prop
   | reshape (s : St) (q : List Nat) : Step p s { s with queue := q }
   | switch (s : St) (g i : Nat) (hi : i < p.K) (hf : i ∉ used s) :
-      Step p s { s with cur := s.cur + 1, holder := some g, gid := some i, dirty := used s, conf := false }
+      Step p s { s with cur := s.cur + 1, holder := some g, gid := some i, dirty := used s, conf := false,
+                        prev := if s.conf then s.holder else none }
   | switchExhausted (s : St) (g : Nat) :
-      Step p s { s with cur := s.cur + 1, holder := some g, gid := none, dirty := used s, conf := false }
+      Step p s { s with cur := s.cur + 1, holder := some g, gid := none, dirty := used s, conf := false,
+                        prev := none }
   | forward (s : St) (g i : Nat) (hm : g ∈ s.queue) (hh : s.holder = some g) (hl : s.timer g > 0)
       (hg : s.gid = some i) :
       Step p s { s with pend := ⟨i, s.cur, g⟩ :: s.pend }
@@ -109,8 +144,7 @@ inductive Step (p : Params) : St → St → Prop
   | commit (s : St) (x : DFrame) (hx : x ∈ s.pend) : Step p s (commitState s x)
   | lose (s : St) (x : DFrame) (hx : x ∈ s.pend) : Step p s { s with pend := s.pend.erase x }
   | readback (s : St) :
-      Step p s { s with conf := (decide (s.gid = some s.nid) && decide (s.drvSess = some s.cur) &&
-                                  decide (s.holder ≠ none)) }
+      Step p s { s with conf := rb s, prev := if rb s then none else s.prev }
   | flush (s : St) : Step p s { s with pend := [], dirty := [] }
   | issue (s : St) (g : Nat) (hv : s.valid g = true) :
       Step p s { s with issued := ⟨g, s.chal⟩ :: s.issued }
@@ -123,6 +157,7 @@ inductive Step (p : Params) : St → St → Prop
       Step p s { s with valid := fun x => if x = p.r then false else s.valid x, cutAt := some s.now }
   | notify (s : St) : Step p s { s with timer := fun x => if x = p.r then 0 else s.timer x }
   | arm (s : St) (b : Bool) : Step p s { s with armed := b }
+  | gateReset (s : St) : Step p s (resetState s)
   | tick (s : St) (o : Bool)
       (ho : o = true → (okAfterTick s = true ∧ s.armed = true) ∨
                        (s.out = true ∧ (if okAfterTick s then 0 else s.offFor + 1) < p.δ)) :
@@ -175,7 +210,25 @@ theorem conf_capable {p : Params} {s : St} (hi : Inv p s) (hc : s.conf = true) {
     · exact h
   exact hi.sessCur x hx (hi.sessGid x hx this)
 
-theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : Step p s t) : Inv p t := by
+theorem ok_holder {s : St} (h : okAfterTick s = true) : live s s.holder = true := by
+  simp [okAfterTick] at h; exact h.2
+
+theorem ok_cases {s : St} (h : okAfterTick s = true) : s.conf = true ∨ live s s.prev = true := by
+  simp [okAfterTick] at h; exact h.1
+
+theorem live_some {s : St} {g : Nat} (h : live s (some g) = true) : s.timer g - 1 > 0 := by
+  simpa [live] using h
+
+/-- Handover invariant. While `prev = some a`: the drive's setpoint is `a`'s or was committed in
+    the current session, and every frame addressed to the drive's id but not to the session id
+    is `a`'s. -/
+structure Hand (p : Params) (s : St) : Prop where
+  drv   : ∀ a, s.prev = some a → s.drvSrc = some a ∨ s.drvSess = some s.cur
+  pend  : ∀ a, s.prev = some a → ∀ x ∈ s.pend, x.addr = s.nid → some x.addr ≠ s.gid → x.origin = a
+  supp2 : ∀ c, s.cutAt = some c → s.supp2 = some p.r → B p c s
+
+theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (hH : Hand p s)
+    (h : Step p s t) : Inv p t := by
   cases h with
   | reshape q => exact ⟨hi.nonce, hi.chalAt, hi.tmax, hi.cutNow, hi.revoked, hi.oldTok, hi.lease,
       hi.outOff, hi.addrUsed, hi.sessGid, hi.sessLe, hi.sessCur, hi.drvLe, hi.drvCur, hi.confOk,
@@ -279,7 +332,7 @@ theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : 
       hi.addrUsed, hi.sessGid, hi.sessLe, hi.sessCur, hi.drvLe, hi.drvCur, ?_, hi.supp, hi.pendR,
       hi.drvR⟩
     intro hc
-    simp at hc
+    simp [rb] at hc
     obtain ⟨⟨h1, h2⟩, h3⟩ := hc
     exact ⟨h1, h2, by simpa using h3⟩
   | flush =>
@@ -333,6 +386,21 @@ theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : 
       hi.sessGid, hi.sessLe, hi.sessCur, hi.drvLe, hi.drvCur, hi.confOk, hi.supp, hi.pendR, hi.drvR⟩
     · intro g; by_cases hg : g = p.r <;> simp [hg, hi.tmax g]
     · intro c _; left; simp
+  | gateReset =>
+    refine ⟨?_, by simp [resetState], by simp [resetState], hi.cutNow, hi.revoked, ?_, ?_,
+      hi.outOff, ?_, ?_, ?_, ?_, ?_, ?_, ?_, hi.supp, ?_, hi.drvR⟩
+    · intro tk htk; have := hi.nonce tk htk; simp [resetState]; omega
+    · intro c hc tk htk hg hn'
+      have := hi.nonce tk htk; simp [resetState] at hn'; omega
+    · intro c _; left; simp [resetState]
+    · simp [resetState]
+    · simp [resetState]
+    · simp [resetState]
+    · simp [resetState]
+    · intro k hk; have := hi.drvLe k hk; simp [resetState]; omega
+    · intro hd; have := hi.drvLe _ hd; simp [resetState] at this; omega
+    · simp [resetState]
+    · simp [resetState]
   | arm b => exact ⟨hi.nonce, hi.chalAt, hi.tmax, hi.cutNow, hi.revoked, hi.oldTok, hi.lease,
       hi.outOff, hi.addrUsed, hi.sessGid, hi.sessLe, hi.sessCur, hi.drvLe, hi.drvCur, hi.confOk,
       hi.supp, hi.pendR, hi.drvR⟩
@@ -341,11 +409,18 @@ theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : 
     have okBound : ∀ c, s.cutAt = some c → okAfterTick s = true → s.holder = some p.r →
         s.now + 1 ≤ c + p.W + p.T := by
       intro c hc hok hh
-      simp [okAfterTick, hh] at hok
+      have hl := ok_holder hok
+      rw [hh] at hl
+      have h1 := live_some hl
       have := live_bound hi hc (by omega)
       omega
-    have okConf : okAfterTick s = true → s.conf = true := by
-      intro hok; simp [okAfterTick] at hok; exact hok.1
+    -- In a handover tick, the previous holder's lease is live too.
+    have prevBound : ∀ c, s.cutAt = some c → live s (some p.r) = true →
+        s.now + 1 ≤ c + p.W + p.T := by
+      intro c hc hl
+      have h1 := live_some hl
+      have := live_bound hi hc (by omega)
+      omega
     refine ⟨hi.nonce, by simp [tickState]; have := hi.chalAt; omega, ?_, ?_, hi.revoked, hi.oldTok,
       ?_, ?_, hi.addrUsed, hi.sessGid, hi.sessLe, hi.sessCur, hi.drvLe, hi.drvCur, hi.confOk,
       ?_, ?_, ?_⟩
@@ -376,10 +451,31 @@ theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : 
     · intro c hc x hx hxr ha
       simp [tickState] at hc ha hx
       by_cases hok : okAfterTick s = true
-      · have hh := conf_capable hi (okConf hok) hx ha
-        rw [hxr] at hh
+      · have hgid : some x.addr = s.gid → s.now + 1 ≤ c + p.W + p.T := by
+          intro hg
+          have ho := hi.sessCur x hx (hi.sessGid x hx hg)
+          rw [hxr] at ho
+          exact okBound c hc hok ho.symm
+        have key : s.now + 1 ≤ c + p.W + p.T := by
+          rcases ok_cases hok with hcf | hpl
+          · have hh := conf_capable hi hcf hx ha
+            rw [hxr] at hh
+            exact okBound c hc hok hh.symm
+          · cases hp : s.prev with
+            | none => rw [hp] at hpl; simp [live] at hpl
+            | some a =>
+              rw [hp] at hpl
+              by_cases hg : some x.addr = s.gid
+              · exact hgid hg
+              · have hn : x.addr = s.nid := by
+                  rcases ha with h | h
+                  · exact h
+                  · exact absurd h hg
+                have hoa := hH.pend a hp x hx hn hg
+                rw [hxr] at hoa
+                subst hoa
+                exact prevBound c hc hpl
         simp [tickState, hok, B]
-        have := okBound c hc hok hh.symm
         omega
       · simp [tickState, hok, B]
         have := hi.pendR c hc x hx hxr ha
@@ -388,21 +484,123 @@ theorem inv_step {p : Params} (hδ : 1 ≤ p.δ) {s t : St} (hi : Inv p s) (h : 
     · intro c hc hd
       simp [tickState] at hc hd
       by_cases hok : okAfterTick s = true
-      · obtain ⟨_, hds, _⟩ := hi.confOk (okConf hok)
-        have hsrc := hi.drvCur hds
-        rw [hd] at hsrc
+      · have hcur : s.drvSess = some s.cur → s.now + 1 ≤ c + p.W + p.T := by
+          intro hds
+          have hsrc := hi.drvCur hds
+          rw [hd] at hsrc
+          exact okBound c hc hok hsrc.symm
+        have key : s.now + 1 ≤ c + p.W + p.T := by
+          rcases ok_cases hok with hcf | hpl
+          · exact hcur (hi.confOk hcf).2.1
+          · cases hp : s.prev with
+            | none => rw [hp] at hpl; simp [live] at hpl
+            | some a =>
+              rw [hp] at hpl
+              rcases hH.drv a hp with hda | hds
+              · rw [hd] at hda
+                have hra : p.r = a := by simpa using hda
+                subst hra
+                exact prevBound c hc hpl
+              · exact hcur hds
         simp [tickState, hok, B]
-        have := okBound c hc hok hsrc.symm
         omega
       · simp [tickState, hok, B]
         have := hi.drvR c hc hd
         simp [B] at this
         omega
 
-theorem inv_reach {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) : Inv p s := by
+theorem hand_init (p : Params) : Hand p init := by
+  refine ⟨?_, ?_, ?_⟩ <;> simp [init]
+
+theorem hand_step {p : Params} {s t : St} (hi : Inv p s) (hH : Hand p s) (h : Step p s t) :
+    Hand p t := by
+  cases h with
+  | switch g i hiK hf =>
+    refine ⟨?_, ?_, hH.supp2⟩
+    · intro a ha
+      by_cases hc : s.conf = true
+      · simp [hc] at ha
+        have := hi.drvCur (hi.confOk hc).2.1
+        left; show s.drvSrc = some a; rw [this, ha]
+      · simp [hc] at ha
+    · intro a ha x hx hn _
+      by_cases hc : s.conf = true
+      · simp [hc] at ha
+        have := conf_capable hi hc hx (Or.inl hn)
+        rw [ha] at this; simpa using this
+      · simp [hc] at ha
+  | switchExhausted g =>
+    exact ⟨by intro a ha; simp at ha, by intro a ha; simp at ha, hH.supp2⟩
+  | forward g i hm hh hl hg =>
+    refine ⟨hH.drv, ?_, hH.supp2⟩
+    intro a ha x hx hn hne
+    simp at hx
+    rcases hx with rfl | hx
+    · exact absurd hg.symm hne
+    · exact hH.pend a ha x hx hn hne
+  | rotate i hg =>
+    refine ⟨hH.drv, ?_, hH.supp2⟩
+    intro a ha x hx hn hne
+    exact absurd (by rw [show x.addr = i from hn, hg]) hne
+  | commit x hx =>
+    have er : ∀ y ∈ s.pend.erase x, y ∈ s.pend := fun y hy => List.mem_of_mem_erase hy
+    unfold commitState
+    by_cases hn : x.addr = s.nid
+    · simp only [hn, ite_true]
+      refine ⟨?_, fun a ha y hy => hH.pend a ha y (er y hy), hH.supp2⟩
+      intro a ha
+      by_cases hg : some x.addr = s.gid
+      · right; show some x.sess = some s.cur; rw [hi.sessGid x hx hg]
+      · left; show some x.origin = some a; rw [hH.pend a ha x hx hn hg]
+    · simp only [hn, ite_false]
+      exact ⟨hH.drv, fun a ha y hy => hH.pend a ha y (er y hy), hH.supp2⟩
+  | lose x hx =>
+    exact ⟨hH.drv, fun a ha y hy => hH.pend a ha y (List.mem_of_mem_erase hy), hH.supp2⟩
+  | readback =>
+    refine ⟨?_, ?_, hH.supp2⟩
+    · intro a ha; split at ha
+      · cases ha
+      · exact hH.drv a ha
+    · intro a ha; split at ha
+      · cases ha
+      · exact hH.pend a ha
+  | flush => exact ⟨hH.drv, by intro a ha x hx; simp at hx, hH.supp2⟩
+  | gateReset =>
+    exact ⟨by intro a ha; simp [resetState] at ha, by intro a ha; simp [resetState] at ha,
+      by simpa [resetState, B] using hH.supp2⟩
+  | cut hcut =>
+    refine ⟨hH.drv, hH.pend, ?_⟩
+    intro c hc _; simp [B] at hc ⊢; omega
+  | tick o ho =>
+    refine ⟨by simpa [tickState] using hH.drv, by simpa [tickState] using hH.pend, ?_⟩
+    intro c hc hs
+    simp [tickState] at hc
+    by_cases hok : okAfterTick s = true
+    · simp [tickState, hok] at hs
+      by_cases hcf : s.conf = true
+      · simp [hcf] at hs
+      · simp [hcf] at hs
+        have hpl : live s (some p.r) = true := by
+          rcases ok_cases hok with h | h
+          · exact absurd h hcf
+          · rw [hs] at h; exact h
+        have h1 := live_some hpl
+        have := live_bound hi hc (by omega)
+        simp [tickState, hok, B]
+        omega
+    · simp [tickState, hok, B] at hs ⊢
+      have := hH.supp2 c hc hs
+      simp [B] at this
+      omega
+  | _ => exact ⟨hH.drv, hH.pend, hH.supp2⟩
+
+theorem both_reach {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) : Inv p s ∧ Hand p s := by
   induction h with
-  | init => exact inv_init p
-  | step _ hst ih => exact inv_step hδ ih hst
+  | init => exact ⟨inv_init p, hand_init p⟩
+  | step _ hst ih => exact ⟨inv_step hδ ih.1 ih.2 hst, hand_step ih.1 ih.2 hst⟩
+
+theorem inv_reach {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) : Inv p s := by
+  exact (both_reach hδ h).1
 
 /-- **Fenced timed finality.** With unbounded downstream delay (frames lost, reordered or stuck
     forever), `K` node ids, arbitrary upstream interference, and a gate that may never learn
@@ -411,12 +609,13 @@ theorem inv_reach {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) : Inv
     that can still commit. -/
 theorem finality {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) {c : Nat}
     (hc : s.cutAt = some c) (hdl : c + p.W + p.T + p.δ ≤ s.now) (hout : s.out = true) :
-    s.supp ≠ some p.r ∧ s.drvSrc ≠ some p.r ∧
+    s.supp ≠ some p.r ∧ s.supp2 ≠ some p.r ∧ s.drvSrc ≠ some p.r ∧
       ∀ x ∈ s.pend, x.origin = p.r → x.addr ≠ s.nid := by
   have hi := inv_reach hδ h
   have hoff := hi.outOff hout
-  refine ⟨?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_⟩
   · intro hs; have := hi.supp c hc hs; simp [B] at this; omega
+  · intro hs; have := (both_reach hδ h).2.supp2 c hc hs; simp [B] at this; omega
   · intro hd; have := hi.drvR c hc hd; simp [B] at this; omega
   · intro x hx hxr ha; have := hi.pendR c hc x hx hxr (Or.inl ha); simp [B] at this; omega
 
@@ -454,6 +653,157 @@ theorem reauthorized_with_stuck_frame :
   exact ⟨_, r23, rfl, by decide, rfl, rfl, by decide⟩
 
 
+/-- After `t_c + W + T` the retired grant holds no live lease, gate resets included. -/
+theorem no_late_lease {p : Params} (hδ : 1 ≤ p.δ) {s : St} (h : Reach p s) {c : Nat}
+    (hc : s.cutAt = some c) (hdl : c + p.W + p.T ≤ s.now) : s.timer p.r = 0 := by
+  rcases (inv_reach hδ h).lease c hc with h0 | h1
+  · exact h0
+  · omega
+
+/-! ## Gate resets that forget persistent state break finality
+
+`ReachWith rst` is the protocol with `rst` as an extra, differently behaved reboot. -/
+
+inductive ReachWith (p : Params) (rst : St → St) : St → Prop
+  | init : ReachWith p rst init
+  | step {s t : St} : ReachWith p rst s → Step p s t → ReachWith p rst t
+  | reset {s : St} : ReachWith p rst s → ReachWith p rst (rst s)
+
+/-- Reboot that restarts the session counter. -/
+def forgetSession (s : St) : St := { resetState s with cur := 0 }
+
+/-- Reboot that restarts the challenge counter. -/
+def forgetChallenge (s : St) : St := { resetState s with chal := 0 }
+
+/-- A reset that forgets the session counter: the retired grant's setpoint (tagged session 1)
+    passes the new grant's session-1 readback, and is energized past the deadline. -/
+theorem forgetful_session_reset :
+    ∃ s, ReachWith P forgetSession s ∧ s.cutAt = some 0 ∧ 3 ≤ s.now ∧ s.out = true ∧
+      s.drvSrc = some P.r := by
+  have r1 := ReachWith.step (ReachWith.init (p := P) (rst := forgetSession)) (Step.issue _ 0 rfl)
+  have r2 := ReachWith.step r1 (Step.redeem _ ⟨0, 0⟩ (by decide) rfl (by decide))
+  have r3 := ReachWith.step r2 (Step.switch _ 0 0 (by decide) (by decide))
+  have r4 := ReachWith.step r3 (Step.reshape _ [0])
+  have r5 := ReachWith.step r4 (Step.forward _ 0 0 (by decide) rfl (by decide) rfl)
+  have r6 := ReachWith.step r5 (Step.commit _ ⟨0, 1, 0⟩ (by decide))
+  have r7 := ReachWith.step r6 (Step.cut _ rfl)
+  have r8 := ReachWith.reset r7
+  have r9 := ReachWith.step r8 (Step.issue _ 1 rfl)
+  have r10 := ReachWith.step r9 (Step.redeem _ ⟨1, 2⟩ (by decide) rfl (by decide))
+  have r11 := ReachWith.step r10 (Step.switch _ 1 1 (by decide) (by decide))
+  have r12 := ReachWith.step r11 (Step.rotate _ 1 rfl)
+  have r13 := ReachWith.step r12 (Step.readback _)
+  have r14 := ReachWith.step r13 (Step.arm _ true)
+  have r15 := ReachWith.step r14 (Step.tick _ true (by intro _; left; decide))
+  have r16 := ReachWith.step r15 (Step.rechallenge _)
+  have r17 := ReachWith.step r16 (Step.issue _ 1 rfl)
+  have r18 := ReachWith.step r17 (Step.redeem _ ⟨1, 4⟩ (by decide) rfl (by decide))
+  have r19 := ReachWith.step r18 (Step.tick _ true (by intro _; left; decide))
+  have r20 := ReachWith.step r19 (Step.rechallenge _)
+  have r21 := ReachWith.step r20 (Step.issue _ 1 rfl)
+  have r22 := ReachWith.step r21 (Step.redeem _ ⟨1, 6⟩ (by decide) rfl (by decide))
+  have r23 := ReachWith.step r22 (Step.tick _ true (by intro _; left; decide))
+  exact ⟨_, r23, rfl, by decide, rfl, rfl⟩
+
+/-- A reset that forgets the challenge counter: a token issued before the cut is replayed and
+    the retired grant holds a live lease after `t_c + W + T` (contrast `no_late_lease`). -/
+theorem forgetful_challenge_reset :
+    ∃ s, ReachWith P forgetChallenge s ∧ s.cutAt = some 0 ∧ 0 + P.W + P.T ≤ s.now ∧
+      s.timer P.r > 0 := by
+  have r1 := ReachWith.step (ReachWith.init (p := P) (rst := forgetChallenge)) (Step.issue _ 0 rfl)
+  have r2 := ReachWith.step r1 (Step.cut _ rfl)
+  have r3 := ReachWith.step r2 (Step.tick _ false (by intro h; cases h))
+  have r4 := ReachWith.step r3 (Step.tick _ false (by intro h; cases h))
+  have r5 := ReachWith.reset r4
+  have r6 := ReachWith.step r5 (Step.redeem _ ⟨0, 0⟩ (by decide) rfl (by decide))
+  exact ⟨_, r6, rfl, by decide, by decide⟩
+
+/-! ## Make-before-break handover
+
+A handover from a confirmed holder keeps LEASE_OK while **both** leases are live, until the new
+holder is confirmed. `bumpless_handover`: authority moves from grant 0 to grant 1 with no tick
+de-energized. `old_lease_alone_breaks`: requiring only the previous holder's lease is unsafe. -/
+
+/-- Grant 0 is confirmed and energized, then grant 1 takes over (new session, rotation, commit,
+    readback). LEASE_OK held at every tick: `offTicks = 0`. -/
+theorem bumpless_handover :
+    ∃ s, Reach P s ∧ s.holder = some 1 ∧ s.conf = true ∧ s.cur = 2 ∧ s.drvSrc = some 1 ∧
+      s.out = true ∧ s.now = 3 ∧ s.offTicks = 0 := by
+  have r1 := Reach.step (Reach.init (p := P)) (Step.issue _ 0 rfl)
+  have r2 := Reach.step r1 (Step.redeem _ ⟨0, 0⟩ (by decide) rfl (by decide))
+  have r3 := Reach.step r2 (Step.switch _ 0 0 (by decide) (by decide))
+  have r4 := Reach.step r3 (Step.reshape _ [0, 1])
+  have r5 := Reach.step r4 (Step.forward _ 0 0 (by decide) rfl (by decide) rfl)
+  have r6 := Reach.step r5 (Step.commit _ ⟨0, 1, 0⟩ (by decide))
+  have r7 := Reach.step r6 (Step.readback _)
+  have r8 := Reach.step r7 (Step.arm _ true)
+  have r9 := Reach.step r8 (Step.tick _ true (by intro _; left; decide))
+  -- renew grant 0, lease grant 1, start the handover
+  have r10 := Reach.step r9 (Step.rechallenge _)
+  have r11 := Reach.step r10 (Step.issue _ 0 rfl)
+  have r12 := Reach.step r11 (Step.redeem _ ⟨0, 2⟩ (by decide) rfl (by decide))
+  have r13 := Reach.step r12 (Step.issue _ 1 rfl)
+  have r14 := Reach.step r13 (Step.redeem _ ⟨1, 3⟩ (by decide) rfl (by decide))
+  have r15 := Reach.step r14 (Step.switch _ 1 1 (by decide) (by decide))
+  have r16 := Reach.step r15 (Step.tick _ true (by intro _; left; decide))
+  have r17 := Reach.step r16 (Step.rotate _ 1 rfl)
+  have r18 := Reach.step r17 (Step.forward _ 1 1 (by decide) rfl (by decide) rfl)
+  have r19 := Reach.step r18 (Step.commit _ ⟨1, 2, 1⟩ (by decide))
+  have r20 := Reach.step r19 (Step.readback _)
+  have r21 := Reach.step r20 (Step.rechallenge _)
+  have r22 := Reach.step r21 (Step.issue _ 1 rfl)
+  have r23 := Reach.step r22 (Step.redeem _ ⟨1, 5⟩ (by decide) rfl (by decide))
+  have r24 := Reach.step r23 (Step.tick _ true (by intro _; left; decide))
+  exact ⟨_, r24, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Without a confirmed holder or a live previous holder there is no LEASE_OK: a handover from
+    an unconfirmed session, or one whose old lease ran out, still pauses. -/
+theorem pause_without_overlap {s : St} (hc : s.conf = false) (hp : live s s.prev = false) :
+    okAfterTick s = false := by
+  simp [okAfterTick, hc, hp]
+
+/-- The unsafe variant: during a handover, LEASE_OK needs only the **previous** holder's lease. -/
+def okNaive (s : St) : Bool := (s.conf && live s s.holder) || live s s.prev
+
+inductive ReachNaive (p : Params) : St → Prop
+  | init : ReachNaive p init
+  | step {s t : St} : ReachNaive p s → Step p s t → ReachNaive p t
+  | ntick {s : St} (o : Bool) : ReachNaive p s → (o = true → okNaive s = true ∧ s.armed = true) →
+      ReachNaive p { s with now := s.now + 1, timer := fun x => s.timer x - 1, out := o }
+
+/-- Grant 1 is confirmed. The gate starts a handover to grant 0, which is then revoked; its one
+    forwarded frame stays downstream. Grant 1's lease alone keeps the output energized, and past
+    the deadline the retired grant's frame commits: an energized output runs the retired grant's
+    setpoint. -/
+theorem old_lease_alone_breaks :
+    ∃ s, ReachNaive P s ∧ s.cutAt = some 0 ∧ 0 + P.W + P.T + P.δ ≤ s.now ∧ s.out = true ∧
+      s.drvSrc = some P.r := by
+  have r1 := ReachNaive.step (ReachNaive.init (p := P)) (Step.issue _ 1 rfl)
+  have r2 := ReachNaive.step r1 (Step.redeem _ ⟨1, 0⟩ (by decide) rfl (by decide))
+  have r3 := ReachNaive.step r2 (Step.switch _ 1 0 (by decide) (by decide))
+  have r4 := ReachNaive.step r3 (Step.reshape _ [0, 1])
+  have r5 := ReachNaive.step r4 (Step.forward _ 1 0 (by decide) rfl (by decide) rfl)
+  have r6 := ReachNaive.step r5 (Step.commit _ ⟨0, 1, 1⟩ (by decide))
+  have r7 := ReachNaive.step r6 (Step.readback _)
+  have r8 := ReachNaive.step r7 (Step.arm _ true)
+  have r9 := ReachNaive.step r8 (Step.issue _ 0 rfl)
+  have r10 := ReachNaive.step r9 (Step.redeem _ ⟨0, 1⟩ (by decide) rfl (by decide))
+  have r11 := ReachNaive.step r10 (Step.switch _ 0 1 (by decide) (by decide))
+  have r12 := ReachNaive.step r11 (Step.forward _ 0 1 (by decide) rfl (by decide) rfl)
+  have r13 := ReachNaive.step r12 (Step.cut _ rfl)
+  have r14 := ReachNaive.step r13 (Step.rotate _ 1 rfl)
+  have r15 := ReachNaive.ntick true r14 (by intro _; decide)
+  have r16 := ReachNaive.step r15 (Step.rechallenge _)
+  have r17 := ReachNaive.step r16 (Step.issue _ 1 rfl)
+  have r18 := ReachNaive.step r17 (Step.redeem _ ⟨1, 3⟩ (by decide) rfl (by decide))
+  have r19 := ReachNaive.ntick true r18 (by intro _; decide)
+  have r20 := ReachNaive.step r19 (Step.rechallenge _)
+  have r21 := ReachNaive.step r20 (Step.issue _ 1 rfl)
+  have r22 := ReachNaive.step r21 (Step.redeem _ ⟨1, 5⟩ (by decide) rfl (by decide))
+  have r23 := ReachNaive.ntick true r22 (by intro _; decide)
+  have r24 := ReachNaive.step r23 (Step.commit _ ⟨1, 2, 0⟩ (by decide))
+  exact ⟨_, r24, rfl, by decide, rfl, rfl⟩
+
 /-! ## Recoverability: no reachable trap state
 
 From **any** reachable state (stuck frames, exhausted ids, revoked grants, gate never notified),
@@ -462,7 +812,7 @@ given a cooperative environment (the next frame is delivered and committed). Thi
 universal "no trap" property, not fairness-based eventual liveness. -/
 
 theorem step_now {p : Params} {s t : St} (h : Step p s t) : t.now = s.now ∨ t.now = s.now + 1 := by
-  cases h <;> simp [commitState, tickState] <;> split <;> simp
+  cases h <;> simp [commitState, tickState, resetState] <;> split <;> simp
 
 theorem recoverable {p : Params} (hK : 2 ≤ p.K) (hT : 0 < p.T) {s : St} (h : Reach p s) (b : Nat)
     (hb : s.valid b = true) :
@@ -486,7 +836,7 @@ theorem recoverable {p : Params} (hK : 2 ≤ p.K) (hT : 0 < p.T) {s : St} (h : R
   have r8 := Reach.step r7 (Step.forward _ b i (by simp) rfl (by simp; omega) rfl)
   have r9 := Reach.step r8 (Step.commit _ ⟨i, s.cur + 1, b⟩ (by simp))
   have r10 := Reach.step r9 (Step.readback _)
-  exact ⟨_, r10, by simp [commitState], by simp [commitState], by simp [commitState]; omega⟩
+  exact ⟨_, r10, by simp [commitState, rb], by simp [commitState], by simp [commitState]; omega⟩
 
 /-! ## Clock drift: the cut is timestamped in real time
 
@@ -521,6 +871,7 @@ theorem step_cut_keep {p : Params} {s t : St} (h : Step p s t) {c : Nat} (hc : s
   | cut h' => rw [hc] at h'; cases h'
   | commit x _ => unfold commitState; split <;> simpa using hc
   | tick o _ => simpa [tickState] using hc
+  | gateReset => simpa [resetState] using hc
   | _ => simpa using hc
 
 theorem step_cut_new {p : Params} {s t : St} (h : Step p s t) (hn : s.cutAt = none) :
@@ -529,6 +880,7 @@ theorem step_cut_new {p : Params} {s t : St} (h : Step p s t) (hn : s.cutAt = no
   | cut _ => right; simp
   | commit x _ => left; unfold commitState; split <;> simpa using hn
   | tick o _ => left; simpa [tickState] using hn
+  | gateReset => left; simpa [resetState] using hn
   | _ => left; simpa using hn
 
 structure DInv (p : Params) (R : Nat) (d : DSt) : Prop where
@@ -592,7 +944,7 @@ theorem dinv_reach {p : Params} {R : Nat} {d : DSt} (h : DReach p R d) : DInv p 
 theorem finality_real {p : Params} {R : Nat} (hR : 1 ≤ R) (hδ : 1 ≤ p.δ) {d : DSt}
     (h : DReach p R d) {rc : Nat} (hrc : d.rcut = some rc)
     (hdl : rc + R * (p.W + p.T + p.δ + 1) ≤ d.rt) (hout : d.s.out = true) :
-    d.s.supp ≠ some p.r ∧ d.s.drvSrc ≠ some p.r ∧
+    d.s.supp ≠ some p.r ∧ d.s.supp2 ≠ some p.r ∧ d.s.drvSrc ≠ some p.r ∧
       ∀ x ∈ d.s.pend, x.origin = p.r → x.addr ≠ d.s.nid := by
   have hi := dinv_reach h
   obtain ⟨c, hc⟩ := Option.ne_none_iff_exists'.mp (fun h0 => by

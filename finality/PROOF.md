@@ -359,6 +359,56 @@ fairness: that would need a trace semantics with fairness assumptions on deliver
 proved. `finality_real` covers a gate clock *slower* than real time, by up to factor R. A
 faster gate clock only makes the real deadline earlier.
 
+### Gate reset and make-before-break handover (also in `FencedFinality.lean`)
+
+**Gate reset.** `Step.gateReset` models a gate reboot at any time:
+
+- **Lost:** every lease timer, the session holder and id, confirmation, arming, the used-id set.
+- **Kept (hardware obligation):** the challenge counter and the session counter, both monotonic
+  across resets (non-volatile counter, or boot-time randomness wide enough never to repeat).
+- **Boot rule:** the verified flush runs before the gate serves anything, which is why the
+  forgotten used-id set may restart empty.
+
+| Theorem | Statement |
+|---|---|
+| `Fenced.finality` | unchanged conclusion, now over traces with any number of gate resets |
+| `Fenced.no_late_lease` | after `t_c + W + T` the retired grant holds no live lease |
+| `Fenced.forgetful_session_reset` | a reset that restarts the session counter: the retired grant's setpoint (session tag 1) passes the new grant's session-1 readback and is energized past the deadline |
+| `Fenced.forgetful_challenge_reset` | a reset that restarts the challenge counter: a pre-cut token is replayed and the retired grant holds a live lease after `t_c + W + T` |
+
+A reset that forgets the used ids **without** flushing is the id-reuse failure already shown in
+`FiniteFence.reuse_breaks`.
+
+**Make-before-break handover.** Before this change every `switch` cleared LEASE_OK until the new
+holder was confirmed, a bounded pause-and-replace. Now:
+
+- `switch` away from a **confirmed** holder records it as `prev`;
+- LEASE_OK = holder's lease live ∧ (holder confirmed ∨ `prev`'s lease live);
+- a successful readback clears `prev`; so do an exhausted switch and a gate reset.
+
+| Theorem | Statement |
+|---|---|
+| `Fenced.finality` | also concludes `supp2 ≠ r`: neither grant supporting energy during a handover is the retired one after the deadline |
+| `Fenced.bumpless_handover` | grant 0 → grant 1 (new session, rotation, commit, readback) with LEASE_OK at every tick (`offTicks = 0`) |
+| `Fenced.pause_without_overlap` | with no confirmed holder and no live previous holder, LEASE_OK is false: such a handover still pauses |
+| `Fenced.old_lease_alone_breaks` | the variant that keeps energy on the **previous** holder's lease alone: the new holder is revoked, its frame stays downstream, and commits past the deadline under the old holder's energy |
+
+Mutation checks (each makes the file fail to compile): the wrong off-tick count in
+`bumpless_handover`; the naive energy rule in place of `okAfterTick`; a session-forgetting
+`resetState`.
+
+Limits of the handover result:
+
+- **Energy, not control freshness.** During the overlap the drive runs the previous holder's last
+  setpoint; the gate already forwards only the new holder's commands. The window lasts until the
+  new holder's first command commits and reads back. It is bumpless in energy, open-loop in
+  control.
+- **Both leases must be live.** A handover from a revoked holder is bumpless only if it completes
+  before that holder's lease runs out (at most `W + T` after the cut); otherwise it pauses.
+- **Existence, not a rate.** `bumpless_handover` is one trace. How often real handovers finish
+  inside the overlap is a hardware measurement (rotation, commit and readback latency against
+  `T`).
+
 ### Still not mechanised
 
 - **Exact-effect grant sets** (Actryn): grants are identities for one protected effect. With
