@@ -81,7 +81,7 @@ specifics.
 | 5 | Fencing protocol and composed theorem; clock drift; recoverability | `FencedFinality.lean` |
 | 6 | Necessity of each rule (counterexample table) | `FinalityProduct`, `GateRefinement`, `FiniteFence`, `Impossibility` §Fence |
 | 7 | Realisation on ODrive v3: node-id fence, filter-renewal window, paired-tag readback, EN_GATE interlock | `odrive/`, `odrive/sil/` |
-| 8 | Evaluation: SIL now; hardware (fence bench, δ, X3 hijack) pending | `odrive/bench/`, `finality/PROOF.md` X3 |
+| 8 | Evaluation: SIL now, including X3 on the gate core; hardware (fence bench, δ, X3 on a motor) pending | `odrive/bench/`, `finality/PROOF.md` X3 |
 | 9 | Related work; limitations; kill criteria | below |
 
 ## Claims and evidence
@@ -119,12 +119,15 @@ Evidence types:
 | C22 | Make-before-break: a handover from a confirmed holder can keep the output energized at every tick while both leases are live; finality still holds | P | `Fenced.bumpless_handover`, `Fenced.finality` (`supp2`) |
 | C23 | Keeping energy on the previous holder's lease alone during a handover is unsafe | P | `Fenced.old_lease_alone_breaks` |
 | C24 | Persistent monotonic challenge and session counters on the gate MCU | A | hardware obligation |
+| C25 | Setpoint hijack in SIL: with a power-only gate, unmodified ODrive CAN code runs the retired controller's setpoint under the new lease; with the gate core (`odrive/gate/gate.h`) it does not, including a lost frame, a stuck frame, lease expiry, gate reset and id exhaustion | E | `odrive/sil` X3a–X3o (five gate mutants each fail a check) |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
 ## Threats to validity (state up front)
 
-- **Model–implementation gap:** no refinement proof from gate firmware to `Fenced.Step`
-  (no gate firmware yet).
+- **Model–implementation gap:** no refinement proof from gate firmware to `Fenced.Step`.
+  The gate core (`odrive/gate/gate.h`) exists and is SIL-tested, but token verification,
+  non-volatile storage, the UART/CAN drivers and the EN_GATE wire do not, and the core has
+  no make-before-break.
 - **Ghost provenance:** the theorems use ghost fields (`drvSrc`, `supp`); their placement is
   part of the trust base.
 - **Liveness:** only "possible" or "recoverable", not eventual liveness under fairness.

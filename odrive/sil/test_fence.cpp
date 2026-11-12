@@ -14,6 +14,7 @@
 #include "can_simple.hpp"
 #include "odrive_main.h"
 #include "protocol.hpp"  // fibre-cpp: the to_string ODrive's ASCII `r` command uses
+#include "gate.h"
 
 // Exactly what `r <float property>` returns: get_string -> to_string(value, buf, 10, 0)
 // (ascii_protocol.cpp:356-357, introspection.hpp:167-168, protocol.hpp:189-191).
@@ -94,6 +95,97 @@ static Snap snap(const Axis& a) {
 // never initialised by the constructor and relies on zero-initialisation.
 static FakeBus bus;
 static CANSimple cs(&bus);
+
+// ---- X3 in SIL: setpoint hijack, power-only gate versus the real gate core (gate/gate.h) ----
+// A = retired controller (origin 0), B = new controller (origin 1). "Energized torque" is
+// input_torque_ while the gate's enable is high. Not tested: timing, the EN_GATE wire, the motor.
+static void down(const gate_frame& f) {
+    can_Message_t m;
+    m.id = f.id;
+    m.isExt = false;
+    std::memcpy(m.buf, f.data, f.len);
+    bus.inject(m);
+}
+static void readback(gate& g) { gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str()); }
+
+static void x3() {
+    enum { A = 0, B = 1, T = 100 };
+    float& tq = axes[0].controller_.input_torque_;
+    const uint64_t other = 1ull << axes[1].config_.can.node_id;
+
+    // P3a, power-only gate: A and B share the drive's bus; the gate only holds B's lease.
+    axes[0].config_.can.node_id = 3;
+    cs.service_stack();
+    bus.inject(torque(3, 0.2f));        // epoch 0: A
+    bool en = true;                     // cut: B is granted the lease, enable follows the lease
+    check(en && tq == 0.2f, "X3a (expected hazard) power-only: A's persistent setpoint is energized under B's lease");
+    bus.inject(torque(3, -0.1f));       // B
+    bus.inject(torque(3, 0.3f));        // A, after the cut
+    check(en && tq == 0.3f, "X3b (expected hazard) power-only: A's late frame replaces B's setpoint under B's lease");
+
+    // P3b, full gate: sole bridge to the drive.
+    gate g;
+    std::memset(&g, 0, sizeof g);
+    gate_boot(&g, 3, other);
+    gate_frame f, stuck;
+    check(!gate_lease_ok(&g, 0), "X3c gate boots with no lease");
+
+    check(gate_grant(&g, A, 0, T, &f), "X3d grant to A rotates the node id");
+    down(f);
+    cs.service_stack();
+    gate_forward(&g, A, 0.2f, &f);
+    down(f);
+    readback(g);
+    check(gate_lease_ok(&g, 1) && tq == 0.2f, "X3e A confirmed by readback: enabled, torque is A's");
+    gate_forward(&g, A, 0.3f, &stuck);  // X3-stuck: held in the gate's TX mailbox, not sent yet
+
+    uint8_t a_node = g.node;
+    check(gate_grant(&g, B, 10, T, &f) && g.node != a_node, "X3f cut: grant to B rotates to a fresh id");
+    down(f);
+    readback(g);
+    check(tq == 0.2f && !gate_lease_ok(&g, 11),
+          "X3g drive still holds A's setpoint, and the gate keeps enable low under B's lease");
+
+    gate_forward(&g, B, -0.1f, &f);
+    down(f);                            // lost: the drive has not renewed its filter yet
+    readback(g);
+    check(tq == 0.2f && !gate_lease_ok(&g, 12), "X3h B's frame lost downstream: readback fails, enable stays low");
+
+    cs.service_stack();
+    down(f);                            // resend
+    readback(g);
+    check(tq == -0.1f && gate_lease_ok(&g, 13), "X3i B's frame installed and read back: enabled, torque is B's");
+
+    check(!gate_forward(&g, A, 0.3f, &f), "X3j gate drops A's command after the cut");
+    Snap before = snap(axes[0]);
+    down(stuck);                        // the held A frame leaves the mailbox now
+    readback(g);
+    check(snap(axes[0]) == before && gate_lease_ok(&g, 14),
+          "X3k stuck A frame released after confirmation is ignored by the drive (old id)");
+
+    check(gate_lease_ok(&g, 10 + T - 1) && !gate_lease_ok(&g, 10 + T),
+          "X3l no renewal: enable drops at lease expiry with no message to the gate");
+
+    // Gate reset: volatile state lost, persistent counters kept.
+    uint32_t sess = g.session;
+    uint64_t used = g.used;
+    gate_boot(&g, g.node, other);
+    check(!gate_lease_ok(&g, 15) && g.session == sess && g.used == used,
+          "X3m gate reset: no lease, session counter and used ids kept");
+
+    // Finite ids: keep switching until none is fresh. The gate must fail closed, not reuse.
+    int switches = 0;
+    while (switches < 100 && gate_grant(&g, switches % 2, 20, T, &f)) {
+        down(f);
+        cs.service_stack();
+        ++switches;
+    }
+    readback(g);
+    check(switches > 0 && switches < 64 && g.holder < 0 && !gate_lease_ok(&g, 21) && !gate_forward(&g, A, 0.5f, &f),
+          "X3n fresh ids exhausted: gate fails closed until a verified flush");
+    gate_flush(&g, g.node, other);
+    check(gate_grant(&g, B, 30, T, &f), "X3o after a verified flush a grant is possible again");
+}
 
 int main() {
     axes[0].config_.can.node_id = 3;
@@ -206,6 +298,8 @@ int main() {
         if (id > 0 && s == ascii_read(float(id))) tags_ok = false;
     }
     check(tags_ok, "R4 all 64 tags (node id + 1) round-trip exactly through the 10-char ASCII readback");
+
+    x3();
 
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL CHECKS AS EXPECTED", failures);
     return failures ? 1 : 0;

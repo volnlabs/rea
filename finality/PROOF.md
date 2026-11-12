@@ -513,3 +513,24 @@ safety-MCU baseline. This is the hardware counterpart of `hijack_without_filter`
 
 Safety: low-voltage, current-limited supply; small τ values; rotor guarded or clamped
 with torque sensor; independent hardware e-stop on the supply.
+
+**SIL version (run, 2026-11-12).** `odrive/sil/test_fence.cpp` section X3 runs this sequence on
+ODrive's unmodified `can_simple.cpp` with the portable gate core `odrive/gate/gate.h`:
+
+| Check | Result |
+|---|---|
+| X3a, X3b power-only gate | hijack: A's persistent setpoint, then A's late frame, are the drive's torque input while B holds the lease |
+| X3g full gate, after the cut | the drive still holds A's setpoint, and the gate keeps enable low |
+| X3h B's frame lost downstream | readback fails, enable stays low |
+| X3i B's frame installed and read back | enable high, torque input is B's |
+| X3j, X3k A's late command; A's stuck frame released after confirmation | dropped by the gate; ignored by the drive |
+| X3l no renewal | enable drops at expiry with no message |
+| X3m, X3n, X3o gate reset; ids exhausted; verified flush | no lease and counters kept; fails closed; usable again |
+
+Five mutants of the gate core (readback always confirms, ids reused, no expiry, forward from
+anyone, reset clears used ids) each fail at least one check.
+
+What this does **not** show: any timing, the EN_GATE wire, phase current or motion. "Energized
+torque" here means `input_torque_` while the gate's enable flag is high. P3a is "falsified if A's
+value never appears" only on hardware; in SIL the baseline arm shows that the firmware's dispatch
+accepts A's frame, which the F-series already established.
