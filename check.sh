@@ -14,4 +14,5 @@ echo "== finality/chain_model.py";            python3 -I finality/chain_model.py
 echo "== odrive/odrive_finality_model.py";    python3 -I odrive/odrive_finality_model.py | tail -1
 echo "== odrive/bench/fence_bench.py";        python3 -I odrive/bench/fence_bench.py --selftest
 echo "== odrive/sil";                         odrive/sil/run.sh | tail -1
+echo "== odrive/sil/mutate.py";                python3 -I odrive/sil/mutate.py | tail -1
 echo "all checks passed"

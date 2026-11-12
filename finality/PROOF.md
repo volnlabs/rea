@@ -527,8 +527,27 @@ ODrive's unmodified `can_simple.cpp` with the portable gate core `odrive/gate/ga
 | X3l no renewal | enable drops at expiry with no message |
 | X3m, X3n, X3o gate reset; ids exhausted; verified flush | no lease and counters kept; fails closed; usable again |
 
-Five mutants of the gate core (readback always confirms, ids reused, no expiry, forward from
-anyone, reset clears used ids) each fail at least one check.
+**Gate core and firmware loop (run, 2026-11-12).** `odrive/gate/` now also holds token redemption,
+authenticated commands, make-before-break and a firmware loop over a board interface. The same
+SIL binary runs them against the ODrive code:
+
+| Series | What it checks |
+|---|---|
+| M1, M2 | SHA-256 and HMAC-SHA-256 against FIPS 180-4 and RFC 4231 vectors |
+| T1–T9 | token accepted only for the open challenge, inside W, once, with a valid tag and unchanged flags; a pre-reset challenge is dead even though the gate clock restarts |
+| C1–C6 | command accepted only under the holder's session key; no replay; 7 lost frames tolerated, 8 not; a spent failed-tag budget drops the holder |
+| H1–H8 | make-before-break: enable stays high only while both leases are live and the old holder was confirmed; confirmation ends the overlap; no overlap flag means revocation |
+| FW0–FW14 | `gate_fw.c` end to end on a host port: challenge stored before sent, rotation stored before sent, UART readback, EN_GATE, expiry without a message, renewal, reset, storage failure fails closed |
+
+`odrive/sil/mutate.py` applies 18 single-rule mutants to `gate.h`; each fails at least one check.
+
+Differences from `FencedFinality.lean`, all on the conservative side:
+- overlap is opt-in per token (the model always overlaps from a confirmed holder);
+- the previous holder cannot renew during the overlap;
+- a gate reset closes the open challenge instead of advancing the counter.
+
+There is no proof that the C code refines the model. The MAC scheme is a draft (one shared key,
+truncated tags).
 
 What this does **not** show: any timing, the EN_GATE wire, phase current or motion. "Energized
 torque" here means `input_torque_` while the gate's enable flag is high. P3a is "falsified if A's

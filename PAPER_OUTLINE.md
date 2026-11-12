@@ -5,7 +5,11 @@ repo. Nothing has been run on motor hardware.
 
 ## Working title
 
-*Energy Is Not Authority: Mechanised Timed Finality for Actuator Handover*
+*When the Gate Is Not the Actuator: Mechanised Timed Finality for Controller Handover*
+
+"Energy is not authority" stays as the slogan for contribution 1, but it no longer carries the
+title: Das (*The Last Gate Before Motion*, Zenodo, Oct 2026) already states that a continuing
+effect needs continuing authority. Our case is the one his theorem assumes away.
 
 The earlier title, "Revoked but Still Moving…", collides with IETF
 draft-das-finality-bound-revocation ("Revoked but Still Executable"). See
@@ -17,6 +21,10 @@ When a controller's authority is revoked, commands it already issued can still r
 actuator: queued, in flight, stuck in a bus controller, or persisting in the drive's setpoint
 register.
 
+- **The gate is not the actuator:** final-gate architectures (Das 2026) assume the gate sees
+  the pending output and checks authority atomically with the effect. A gate in front of a
+  stock drive cannot: the drive holds the setpoint, and queues behind the gate can hide
+  commands. This paper is about that case.
 - **Energy is not authority:** device-side fencing (Chubby sequencers, Raft terms, PROFIsafe
   sequence numbers, Spot leases) and energy removal (STO) are known. We show that composing
   them naively is unsafe with persistent setpoints: an energy gate held by the new authority
@@ -40,7 +48,8 @@ Revised after the related-work check (`finality/RELATED_WORK.md`). The individua
 sink fences) are prior art, so the contributions are the composition and its physical
 specifics.
 
-1. **Energy authority is not command authority.** With persistent actuator setpoints, an
+1. **Energy authority is not command authority when the gate is not atomic with the effect.**
+   With persistent actuator setpoints held by a device behind the gate, an
    STO-like energy gate lets a retired controller's command execute under the new authority's
    lease (setpoint hijack). The gate must bind energy to the provenance of the command being
    executed (`Product.Counterexamples.command_bypass`, `no_filter`; `GateRefinement`
@@ -64,6 +73,8 @@ specifics.
    - ODrive's CAN node-id dispatch repurposed as an epoch fence;
    - paired-tag session readback;
    - both executed by SIL on unmodified firmware (mutation-checked).
+   - the gate logic as portable C, run against the same firmware code with tokens, authenticated
+     commands, make-before-break and a firmware loop (mutation-checked).
 5. **Supporting result, not a headline:** a mechanised statement of the known
    lease-without-fencing limitation for hidden commits (`Impossibility.lean`). Cite Chubby
    §2.4 lock-delay, Kleppmann 2016, and Santos-Grueiro arXiv 2609.02866 as closest.
@@ -119,15 +130,22 @@ Evidence types:
 | C22 | Make-before-break: a handover from a confirmed holder can keep the output energized at every tick while both leases are live; finality still holds | P | `Fenced.bumpless_handover`, `Fenced.finality` (`supp2`) |
 | C23 | Keeping energy on the previous holder's lease alone during a handover is unsafe | P | `Fenced.old_lease_alone_breaks` |
 | C24 | Persistent monotonic challenge and session counters on the gate MCU | A | hardware obligation |
-| C25 | Setpoint hijack in SIL: with a power-only gate, unmodified ODrive CAN code runs the retired controller's setpoint under the new lease; with the gate core (`odrive/gate/gate.h`) it does not, including a lost frame, a stuck frame, lease expiry, gate reset and id exhaustion | E | `odrive/sil` X3a–X3o (five gate mutants each fail a check) |
+| C25 | Setpoint hijack in SIL: with a power-only gate, unmodified ODrive CAN code runs the retired controller's setpoint under the new lease; with the gate core (`odrive/gate/gate.h`) it does not, including a lost frame, a stuck frame, lease expiry, gate reset and id exhaustion | E | `odrive/sil` X3a–X3o; `mutate.py` |
+| C26 | The gate core accepts a token only for the open challenge, inside W, once, with a valid tag; commands are accepted only under the holder's session key, each sequence number once; a spent failed-tag budget drops the holder | E | `odrive/sil` T1–T9, C1–C6 |
+| C27 | Make-before-break in the gate core: enable stays high across a handover only while both leases are live and the old holder was confirmed; confirmation ends the overlap | E | `odrive/sil` H1–H8 (code counterpart of C22, C23) |
+| C28 | A firmware loop over a board interface runs the whole sequence (challenge, token, rotation, authenticated command, UART readback, EN_GATE, expiry, reset, storage failure) on a host port against unmodified ODrive CAN code | E | `odrive/gate/gate_fw.c`; `odrive/sil` FW0–FW14 |
+| C29 | Every one of 18 single-rule mutants of the gate core fails at least one SIL check | E | `odrive/sil/mutate.py` |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
 ## Threats to validity (state up front)
 
 - **Model–implementation gap:** no refinement proof from gate firmware to `Fenced.Step`.
-  The gate core (`odrive/gate/gate.h`) exists and is SIL-tested, but token verification,
-  non-volatile storage, the UART/CAN drivers and the EN_GATE wire do not, and the core has
-  no make-before-break.
+  The gate core and firmware loop (`odrive/gate/`) exist and are SIL-tested on a host port.
+  The STM32 port (CAN, UART, flash, clock, EN_GATE pin) does not exist, nothing is
+  timing-verified, and the code has never run on an MCU.
+- **Message authentication is a draft:** one shared HMAC key, tags truncated to 64 bits
+  (tokens) and 32 bits (commands, with a failed-tag budget) to fit classic CAN. Not reviewed
+  cryptography; C16 stays an assumption.
 - **Ghost provenance:** the theorems use ghost fields (`drvSrc`, `supp`); their placement is
   part of the trust base.
 - **Liveness:** only "possible" or "recoverable", not eventual liveness under fairness.
@@ -143,7 +161,7 @@ Evidence types:
 
 | Criterion | Status |
 |---|---|
-| A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. See `finality/RELATED_WORK.md` |
+| A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. **Further narrowed (2026-11-12):** Das's *Last Gate Before Motion* publishes the final-gate architecture and continuing-effect authority as a paper theorem, under the assumption that the gate observes the pending output and checks atomically. Our claim is restricted to the case where that assumption fails. See `finality/RELATED_WORK.md` |
 | The device cannot expose a defensible finality point | Pi 5 RP1: **triggered**. ODrive v3: **not triggered** (C8, C9), but δ (C13) is unbounded in the datasheet |
 | No better than a safety-MCU baseline | **Not triggered in proofs**: C6 (provenance) and C22 (energy stays on across a handover, which pause-and-replace cannot do). Needs X3 (C18) and a measured handover-overlap success rate on hardware |
 

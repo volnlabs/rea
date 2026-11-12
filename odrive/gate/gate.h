@@ -1,25 +1,37 @@
-// Gate core: the lease, fence and interlock logic of the final gate, with no HAL.
-// Portable C (also valid C++). The same file is meant to be compiled into the gate MCU firmware
-// and into the SIL test (../sil/test_fence.cpp, section X3).
+// Gate core: the lease, fence, token and interlock logic of the final gate, with no HAL.
+// Portable C (also valid C++). The same file is compiled into the gate firmware loop
+// (gate_fw.c) and into the SIL test (../sil/test_fence.cpp).
 //
-// Mirrors FencedFinality.lean: switch -> fresh node id + unconfirmed; readback confirms the
-// session; LEASE_OK = holder's lease live AND session confirmed. Revocation is non-renewal.
+// Mirrors FencedFinality.lean:
+//  - redeem: a token is accepted only for the open challenge, inside the window W, once;
+//  - switch: a holder change takes a fresh node id and clears confirmation;
+//  - readback confirms the session;
+//  - LEASE_OK = holder's lease live AND (session confirmed OR previous holder's lease live).
+// Revocation is non-renewal: no message has to reach the gate.
 //
-// Not here (obligations on the firmware around this core):
-//  - token authentication and challenge freshness (C16): call gate_grant only after verifying;
-//  - `session` and `used` must be stored non-volatile before LEASE_OK may rise (C24);
+// Obligations on the firmware around this core:
+//  - `session`, `used`, `chal` and `node` are stored non-volatile before they take effect (C24);
 //  - gate_flush may be called only after a verified flush: TX abort + drive reset (C14);
-//  - `now` must come from the gate's own monotonic clock.
-// ponytail: single protected effect, no make-before-break (`prev`); add when handover overlap
-// is measured on hardware.
+//  - `now` comes from the gate's own monotonic clock;
+//  - the gate is the only path to the drive's bus and EN_GATE (C15).
+//
+// Message authentication is a draft, not reviewed cryptography (C16): HMAC-SHA-256 with one
+// key shared by the authority service and the gate, tags truncated to fit classic CAN frames.
+// ponytail: one shared key and 32-bit command tags with a per-session failure budget; move to
+// per-controller keys and CAN FD (full tags) before any real deployment.
+// Integers in MACs are in host byte order: every party must be little-endian.
 #ifndef GATE_H
 #define GATE_H
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "gate_mac.h"
 
 enum { GATE_CMD_SET_NODE_ID = 0x006, GATE_CMD_SET_INPUT_VEL = 0x00D };  // ODrive CANSimple
+enum { GATE_REJECT = 0, GATE_RENEWED = 1, GATE_ROTATE = 2 };            // gate_token results
+enum { GATE_OVERLAP = 1 };  // token flag: keep energy on the previous holder's lease (handover)
+enum { GATE_SEQ_WINDOW = 8, GATE_MAX_BAD = 16 };
 
 typedef struct { uint32_t id; uint8_t len; uint8_t data[8]; } gate_frame;
 
@@ -27,30 +39,69 @@ typedef struct {
     // Persistent: must survive a gate reset.
     uint32_t session;   // monotonic count of holder changes
     uint64_t used;      // node ids unusable until the next verified flush (bit i = id i)
+    uint32_t chal;      // monotonic challenge counter
     // Volatile: lost on reset, rebuilt by gate_boot.
     int holder;         // origin id of the current grant, -1 = none
-    uint8_t node;       // the drive's current node id
+    uint8_t node;       // the drive's current node id (also stored non-volatile)
     uint32_t expiry;    // gate tick at which the holder's lease ends
     bool confirmed;     // readback matched this session's tag
+    int prev;           // previous holder whose lease still supports the output, -1 = none
+    uint32_t prev_expiry;
+    bool chal_open;     // a challenge is outstanding and unused
+    uint32_t chal_at;   // gate tick at which it was issued
+    uint8_t ks[32];     // session key for the holder's commands
+    uint32_t seq;       // next expected command sequence number
+    uint8_t bad;        // failed command tags this session
 } gate;
 
-static inline gate_frame gate_mk(uint8_t node, uint32_t cmd, const void* p, uint8_t n) {
+static inline gate_frame gate_raw(uint32_t id, const void* p, uint8_t n) {
     gate_frame f;
     memset(&f, 0, sizeof f);
-    f.id = ((uint32_t)node << 5) | cmd;
+    f.id = id;
     f.len = n;
     memcpy(f.data, p, n);
     return f;
 }
+static inline gate_frame gate_mk(uint8_t node, uint32_t cmd, const void* p, uint8_t n) {
+    return gate_raw(((uint32_t)node << 5) | cmd, p, n);
+}
+static inline bool gate_live(uint32_t expiry, uint32_t now) { return (int32_t)(expiry - now) > 0; }
+static inline void gate_drop(gate* g) { g->holder = -1; g->prev = -1; g->confirmed = false; }
 
+// ---- MACs, shared with the authority service and the controllers ----
+static inline void gate_token_mac(const uint8_t key[32], uint8_t origin, uint8_t flags, uint32_t chal, uint8_t out[8]) {
+    uint8_t m[7] = {'T', origin, flags}, h[32];
+    memcpy(m + 3, &chal, 4);
+    gate_hmac(key, 32, m, sizeof m, h);
+    memcpy(out, h, 8);
+}
+// The authority service gives this to the controller it grants; `chal` is the grant's challenge.
+static inline void gate_session_key(const uint8_t key[32], uint8_t origin, uint32_t chal, uint8_t out[32]) {
+    uint8_t m[6] = {'S', origin};
+    memcpy(m + 2, &chal, 4);
+    gate_hmac(key, 32, m, sizeof m, out);
+}
+// Command frame payload: 4 bytes of torque, then this 4-byte tag.
+static inline void gate_cmd_mac(const uint8_t ks[32], uint32_t seq, const uint8_t torque[4], uint8_t out[4]) {
+    uint8_t m[9] = {'C'}, h[32];
+    memcpy(m + 1, &seq, 4);
+    memcpy(m + 5, torque, 4);
+    gate_hmac(ks, 32, m, sizeof m, h);
+    memcpy(out, h, 4);
+}
+
+// ---- Lifecycle ----
 // Boot or reset. `drive_node` is the id the drive answers to now; `reserved` are ids of other
-// nodes on the downstream bus. Persistent fields are kept; nobody holds a lease after boot.
+// nodes on the downstream bus. Persistent fields are kept; nobody holds a lease after boot and
+// no challenge is open, so a token issued before the reset cannot be redeemed.
 static inline void gate_boot(gate* g, uint8_t drive_node, uint64_t reserved) {
     g->used |= reserved | (1ull << drive_node);
-    g->holder = -1;
     g->node = drive_node;
-    g->expiry = 0;
-    g->confirmed = false;
+    g->expiry = g->prev_expiry = g->chal_at = g->seq = 0;
+    g->chal_open = false;
+    g->bad = 0;
+    memset(g->ks, 0, sizeof g->ks);
+    gate_drop(g);
 }
 
 // After a verified flush nothing addressed to an old id can still arrive, so ids are free again.
@@ -59,13 +110,17 @@ static inline void gate_flush(gate* g, uint8_t drive_node, uint64_t reserved) {
     gate_boot(g, drive_node, reserved);
 }
 
-// A verified token for `origin` arrived at gate time `now`; the lease runs for `T` ticks.
+// ---- Leases ----
+// A verified grant for `origin` at gate time `now`; the lease runs for `T` ticks.
 // Returns true when `rot` must be sent downstream (a holder change rotates the node id).
-// With no fresh id left the gate fails closed until gate_flush.
-static inline bool gate_grant(gate* g, int origin, uint32_t now, uint32_t T, gate_frame* rot) {
+// With `overlap`, a confirmed holder whose lease is live keeps supporting the output until the
+// new session is confirmed or that lease ends (make-before-break). The old lease is never
+// extended, and both leases must be live. With no fresh id left the gate fails closed.
+static inline bool gate_grant(gate* g, int origin, uint32_t now, uint32_t T, bool overlap, gate_frame* rot) {
     if (origin == g->holder) { g->expiry = now + T; return false; }
-    g->holder = -1;
-    g->confirmed = false;
+    int old = overlap && g->holder >= 0 && g->confirmed && gate_live(g->expiry, now) ? g->holder : -1;
+    uint32_t old_expiry = g->expiry;
+    gate_drop(g);
     for (uint8_t id = 0; id < 64; ++id) {
         if (g->used & (1ull << id)) continue;
         uint32_t v = id;
@@ -75,14 +130,39 @@ static inline bool gate_grant(gate* g, int origin, uint32_t now, uint32_t T, gat
         g->session++;
         g->holder = origin;
         g->expiry = now + T;
+        g->prev = old;
+        g->prev_expiry = old_expiry;
         return true;
     }
     return false;
 }
 
-// A command from `origin` arrived upstream. Returns true when `out` must be sent downstream.
-// The session tag (node id + 1) and the value travel in one frame, so the drive installs both
-// or neither.
+// Issue a fresh challenge. Store `chal` non-volatile before sending it.
+static inline uint32_t gate_challenge(gate* g, uint32_t now) {
+    g->chal_at = now;
+    g->chal_open = true;
+    return ++g->chal;
+}
+
+// Redeem a token. Accepted only for the open challenge, within `W` ticks of its issue, with a
+// valid tag, and only once. On GATE_ROTATE send `rot` downstream after storing the new state.
+static inline int gate_token(gate* g, const uint8_t key[32], uint8_t origin, uint8_t flags, uint32_t chal,
+                             const uint8_t mac[8], uint32_t now, uint32_t W, uint32_t T, gate_frame* rot) {
+    uint8_t want[8];
+    if (!g->chal_open || chal != g->chal || now - g->chal_at >= W) return GATE_REJECT;
+    gate_token_mac(key, origin, flags, chal, want);
+    if (!gate_eq(mac, want, 8)) return GATE_REJECT;
+    g->chal_open = false;
+    if (!gate_grant(g, origin, now, T, flags & GATE_OVERLAP, rot)) return g->holder < 0 ? GATE_REJECT : GATE_RENEWED;
+    gate_session_key(key, origin, chal, g->ks);
+    g->seq = 0;
+    g->bad = 0;
+    return GATE_ROTATE;
+}
+
+// ---- Commands ----
+// A command from `origin`. Returns true when `out` must be sent downstream. The session tag
+// (node id + 1) and the value travel in one frame, so the drive installs both or neither.
 static inline bool gate_forward(const gate* g, int origin, float torque, gate_frame* out) {
     if (origin != g->holder || g->holder < 0) return false;
     float pair[2] = {(float)(g->node + 1), torque};
@@ -90,13 +170,37 @@ static inline bool gate_forward(const gate* g, int origin, float torque, gate_fr
     return true;
 }
 
-// `tag_ascii` is the drive's answer to `r axis0.controller.input_vel` over UART.
+// An authenticated command frame from upstream: d = torque (4 bytes) + tag (4 bytes). The sender
+// is whoever holds the session key, not an id in the frame. Each sequence number is accepted
+// once; up to GATE_SEQ_WINDOW - 1 lost frames are tolerated. After GATE_MAX_BAD failed tags the
+// holder is dropped, which bounds forgery attempts per session (and lets an upstream attacker
+// force a re-grant: availability, not safety).
+static inline bool gate_command(gate* g, const uint8_t d[8], gate_frame* out) {
+    uint8_t want[4];
+    float torque;
+    if (g->holder < 0) return false;
+    for (uint32_t k = 0; k < GATE_SEQ_WINDOW; ++k) {
+        gate_cmd_mac(g->ks, g->seq + k, d, want);
+        if (!gate_eq(d + 4, want, 4)) continue;
+        g->seq += k + 1;
+        memcpy(&torque, d, 4);
+        return gate_forward(g, g->holder, torque, out);
+    }
+    if (++g->bad >= GATE_MAX_BAD) gate_drop(g);
+    return false;
+}
+
+// ---- Interlock ----
+// `tag_ascii` is the drive's answer to `r axis0.controller.input_vel` over UART. Once the new
+// session is confirmed the previous holder's lease no longer matters.
 static inline void gate_readback(gate* g, const char* tag_ascii) {
     g->confirmed = g->holder >= 0 && strtof(tag_ascii, NULL) == (float)(g->node + 1);
+    if (g->confirmed) g->prev = -1;
 }
 
 // Drives EN_GATE. False once the lease runs out, with no message needed.
 static inline bool gate_lease_ok(const gate* g, uint32_t now) {
-    return g->holder >= 0 && g->confirmed && (int32_t)(g->expiry - now) > 0;
+    return g->holder >= 0 && gate_live(g->expiry, now) &&
+           (g->confirmed || (g->prev >= 0 && gate_live(g->prev_expiry, now)));
 }
 #endif
