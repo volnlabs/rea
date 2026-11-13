@@ -11,8 +11,8 @@ date. Check each listing against the "must have" column, because clone boards di
 | ST-Link V2 (or clone) | SWD | Flash fw 0.5.6 at the pinned commit `3a2e4dd1`; recover a bricked clone |
 | USB-CAN adapter | Linux SocketCAN support (`gs_usb`/candleLight firmware or PCAN); 250 kbit/s | Command path; second adapter optional as the "retired controller" |
 | USB-UART adapter, 3.3 V | 115200 baud; **3.3 V logic only** | ODrive ASCII protocol: node-id rotation and readback |
-| Gate MCU dev board | Two CAN-capable or one CAN + one UART, a hardware timer, a GPIO for EN_GATE, non-volatile counter storage (flash/FRAM/backup register). An STM32 Nucleo or an RP2040 with an external CAN transceiver both fit | The final gate: leases, fence, interlock (C24: persistent counters) |
-| CAN transceiver breakout (if the gate MCU has none) | 3.3 V, e.g. SN65HVD230 class | Gate ↔ bus |
+| Gate MCU dev board | **Two CAN controllers** (upstream and downstream buses are separate) + one UART, a hardware timer with a one-shot output for EN_GATE (`port_en_gate` in `../gate/gate_port.h`), non-volatile storage. A NUCLEO-F446RE fits (CAN1 + CAN2, one-pulse timers); it needs **two** external transceivers. An RP2040 has no CAN controller and does not fit the firmware loop as written | The final gate: `../gate/gate_fw.c` (C24: persistent counters) |
+| 2 × CAN transceiver breakout (the Nucleo has none) | 3.3 V, e.g. SN65HVD230 class | Gate ↔ upstream bus, gate ↔ drive |
 | Logic analyzer | ≥ 8 channels, ≥ 24 MS/s; sigrok support | Independent capture: EN_GATE, gate-driver outputs (GH/GL), CAN RX/TX, UART, a cut marker |
 | Bench supply | 12–24 V, adjustable **current limit** (start at 1 A) | Safe power; never a battery for first tests |
 | Small BLDC motor + encoder | Low power (gimbal or small outrunner), encoder ODrive supports | X3 only. `fence_bench.py` and δ need **no motor** |
@@ -43,6 +43,10 @@ date. Check each listing against the "must have" column, because clone boards di
 
 - **Clone quality:** some v3.6 clones ship with locked or modified bootloaders, or omit the CAN
   transceiver. Confirm SWD access and the transceiver in the listing photos before buying.
-- **Gate MCU family:** an STM32 with a hardware break input matches `../STM32_BREAK_GATE.md`
-  most directly; an RP2040 is simpler to program but needs an external transceiver and has no
-  break input.
+- **Gate MCU family:** an STM32 with two CAN controllers and a one-pulse timer output matches
+  `../gate/gate_fw.c` and `../STM32_BREAK_GATE.md`. The STM32 port of the board interface is
+  not written.
+- **Gate storage endurance:** the firmware writes storage once per holder change and once per
+  `GATE_CHAL_CHUNK` challenges (default 1024). MCU flash is rated around 10,000 erase cycles per
+  sector, so the port needs wear levelling across a sector, or FRAM. Measure the write time: it
+  sits inside the handover path.

@@ -12,7 +12,9 @@ void port_up_send(const gate_frame* f);
 void port_down_send(const gate_frame* f);         // downstream CAN: the only path to the drive
 void port_uart_write(const char* s);              // drive UART (ASCII protocol)
 bool port_uart_line(char* buf, int n);            // one complete line from the drive, non-blocking
-void port_en_gate(bool on);                       // the EN_GATE interlock output
+// The EN_GATE interlock output: high for at most `ms` from now, 0 = low now. Must be a hardware
+// one-shot (timer output, re-armed by each call) so that EN_GATE falls on time if the firmware hangs.
+void port_en_gate(uint32_t ms);
 bool port_nv_load(gate_nv* nv);                   // false: not provisioned or corrupt
 bool port_nv_store(const gate_nv* nv);            // true only once the write is durable
 const uint8_t* port_key(void);                    // 32-byte key shared with the authority service

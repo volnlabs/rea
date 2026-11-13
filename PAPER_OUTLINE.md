@@ -74,7 +74,13 @@ specifics.
    - paired-tag session readback;
    - both executed by SIL on unmodified firmware (mutation-checked).
    - the gate logic as portable C, run against the same firmware code with tokens, authenticated
-     commands, make-before-break and a firmware loop (mutation-checked).
+     commands, make-before-break and a firmware loop (mutation-checked);
+   - the firmware loop's C code explored against the finality property itself, exhaustively at
+     small bounds, under delay, loss, replay, forgery, resets, crashes and a hung loop (C31);
+   - honest negatives: the first code had two finality bugs, both in places where the model
+     abstracts (32-bit clock wrap against unbounded time, C30; a predictable challenge against
+     "the authority issues only for the current challenge", C35). Found by review, fixed; the
+     first fix is proved, the second is checked by exploration with its counterexample.
 5. **Supporting result, not a headline:** a mechanised statement of the known
    lease-without-fencing limitation for hidden commits (`Impossibility.lean`). Cite Chubby
    §2.4 lock-delay, Kleppmann 2016, and Santos-Grueiro arXiv 2609.02866 as closest.
@@ -122,7 +128,7 @@ Evidence types:
 | C13 | δ (EN_GATE↓ → gates off) is bounded | A / O | TI DRV8301 gives no maximum; measure |
 | C14 | Verified flush (gate TX abort + drive reset) clears downstream | A | hardware obligation |
 | C15 | Gate exclusivity (sole command and energy path) | A | wiring obligation |
-| C16 | Authenticated, unforgeable tokens; unpredictable challenges | A | crypto obligation (abstracted) |
+| C16 | Authenticated, unforgeable tokens; challenges the authority can tell the gate issued (unpredictable, or tagged by the gate) | A | crypto obligation (abstracted in the proofs; draft MAC scheme in `odrive/gate/`) |
 | C17 | Fence holds on real CAN hardware and timing | O | `odrive/bench/fence_bench.py`, needs board |
 | C18 | Hijack physically observable with a power-only gate and absent with the full gate | O | X3, needs bench |
 | C19 | Multikernel Linux (master `bca8ae161fa6`) can re-lease a PCI function before the retired kernel's CPUs are confirmed stopped, so stale MMIO reaches the device under the new lease; the finality bound does not depend on Multikernel cut latency | S | `finality/MULTIKERNEL.md` (static reading; reference design, no repro planned) |
@@ -134,13 +140,22 @@ Evidence types:
 | C26 | The gate core accepts a token only for the open challenge, inside W, once, with a valid tag; commands are accepted only under the holder's session key, each sequence number once; a spent failed-tag budget drops the holder | E | `odrive/sil` T1–T9, C1–C6 |
 | C27 | Make-before-break in the gate core: enable stays high across a handover only while both leases are live and the old holder was confirmed; confirmation ends the overlap | E | `odrive/sil` H1–H8 (code counterpart of C22, C23) |
 | C28 | A firmware loop over a board interface runs the whole sequence (challenge, token, rotation, authenticated command, UART readback, EN_GATE, expiry, reset, storage failure) on a host port against unmodified ODrive CAN code | E | `odrive/gate/gate_fw.c`; `odrive/sil` FW0–FW14 |
-| C29 | Every one of 18 single-rule mutants of the gate core fails at least one SIL check | E | `odrive/sil/mutate.py` |
+| C29 | Every one of 28 mutants of the gate core and firmware loop fails at least one SIL check | E | `odrive/sil/mutate.py` |
+| C30 | A deadline test on a wrapping 32-bit clock revives an ended lease 2^31 ticks later (found in our own gate core, reproduced, fixed); latching expiry is sound for any number of wraps if the gate looks at the clock at least once every 2^31 − T ticks | P, E | `ClockWrap.live_iff`, `zombie`, `latch_sound`, `no_latch_unsound`; `odrive/sil` W1–W4 |
+| C31 | Timed finality (I1) and attribution (I2) hold for the gate firmware's C code in every reachable state of a bounded adversarial environment: delayed, lost and reordered downstream frames, replayed and forged tokens and commands, stale readback, gate reset, crash after a storage write, failed write, drive reboot, firmware hang | M (on code) | `odrive/sil/explore.c`: exhaustive at small bounds, random walks at larger ones |
+| C32 | Which gate rules finality needs: removing one breaks I1 or I2 in the explored space; the rest are hardening, availability or promptness | M (on code) | `mutate.py` against `explore.c`; table in `PROOF.md` |
+| C33 | EN_GATE held by a hardware one-shot armed with the time left on the lease: a hung firmware loop cannot extend the output past the lease | M (on code), A | `gate_enable_for`; `explore.c` fault "firmware hangs"; the timer is a hardware obligation |
+| C35 | A predictable challenge that the authority cannot verify breaks finality: a token obtained for a future challenge outlives its holder's revocation (found in our own firmware loop; fixed with a gate-tagged challenge, no RNG needed) | M (on code) | `explore.c` with `-DAUTHORITY_UNCHECKED`: 19-step I1 counterexample; mutant "challenge tag not bound to its value" |
+| C34 | The gate firmware loop compiles for Cortex-M4 and Cortex-M0+ with no dependencies beyond the board interface, `memcpy`/`memmove`/`memset` and `strtof` (about 3 kB of code) | E (compile only) | `check.sh` |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
 ## Threats to validity (state up front)
 
 - **Model–implementation gap:** no refinement proof from gate firmware to `Fenced.Step`.
-  The gate core and firmware loop (`odrive/gate/`) exist and are SIL-tested on a host port.
+  The gate core and firmware loop (`odrive/gate/`) exist, are SIL-tested on a host port and are
+  explored against the finality properties, exhaustively only at small bounds (C31). The
+  model and the code already differ in listed ways (`PROOF.md`), and one real bug (C30) sat
+  in exactly such a difference: unbounded time in the model, a 32-bit clock in the code.
   The STM32 port (CAN, UART, flash, clock, EN_GATE pin) does not exist, nothing is
   timing-verified, and the code has never run on an MCU.
 - **Message authentication is a draft:** one shared HMAC key, tags truncated to 64 bits

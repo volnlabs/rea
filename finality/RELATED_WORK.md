@@ -144,7 +144,16 @@ safety-MCU baseline") still has to be tested against an ownership-reset baseline
   Simplex/runtime-assurance line).
 - **Full texts:** of the three 2026 preprints (abstracts only).
 
+**Known bug class we hit ourselves (2026-11-12).** Our first gate core tested lease expiry with
+a signed difference on a wrapping 32-bit clock, which revives an ended lease 2^31 ticks later
+(`PROOF.md`, `ClockWrap.lean`). This is a known class, not a contribution: TCP's PAWS has the
+same hazard with 32-bit timestamps and the same remedy, invalidating the stored timestamp once a
+connection has been idle for more than 24 days (RFC 7323 §5.5, read). What we add is only that a
+model with unbounded time cannot see it, and that the latch is proved.
+
 ## Sources
+
+- RFC 7323 §5.5 (outdated timestamps): <https://www.rfc-editor.org/rfc/rfc7323.txt>
 
 - Kleppmann 2016: <https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html>
 - Burrows, Chubby (OSDI 2006): <https://static.usenix.org/event/osdi06/tech/full_papers/burrows/burrows_html/>

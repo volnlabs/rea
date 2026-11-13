@@ -1,10 +1,13 @@
 // Gate firmware loop: glue between the board (gate_port.h) and the gate core (gate.h).
 // Run in SIL against unmodified ODrive CAN code (../sil/test_fence.cpp, section FW). Never run
 // on an MCU: the STM32 port does not exist yet, and nothing here is timing-verified.
+// EN_GATE is re-armed on every poll for the time left on the lease (port_en_gate), so a hung
+// loop cannot hold it high past the lease.
 //
 // Upstream CAN protocol (classic CAN, 11-bit ids):
 //   0x010 CHAL_REQ  any -> gate   (empty)
-//   0x011 CHAL      gate -> all   chal u32
+//   0x011 CHAL      gate -> all   chal u32, tag[4]  (the open challenge, or a fresh one; the tag
+//                                 proves to the authority that the gate issued it)
 //   0x020 TOKEN1    any -> gate   origin u8, flags u8, chal u32
 //   0x021 TOKEN2    any -> gate   tag[8]            (completes the last TOKEN1)
 //   0x030 CMD       holder -> gate  torque f32, tag[4]
@@ -20,12 +23,16 @@ enum { UP_CHAL_REQ = 0x010, UP_CHAL = 0x011, UP_TOKEN1 = 0x020, UP_TOKEN2 = 0x02
 #ifndef GATE_T_MS
 #define GATE_T_MS 200u    // lease length
 #endif
+#ifndef GATE_CHAL_CHUNK
+#define GATE_CHAL_CHUNK 1024u  // challenge values reserved per storage write (flash endurance)
+#endif
 #ifndef GATE_RB_MS
 #define GATE_RB_MS 5u     // readback poll period
 #endif
 
 static gate g;
 static bool ok;           // false: fail closed until the next reset
+static uint32_t chal_top; // stored: no challenge above this has been sent. Boot resumes above it.
 static uint8_t t1[6];
 static bool have_t1;
 static uint32_t last_rb;
@@ -33,23 +40,27 @@ static uint32_t last_rb;
 const gate* gate_fw_state(void) { return &g; }
 
 // State that must be durable before it takes effect. A failed write disables the gate.
+// The challenge counter is stored as a reserved ceiling, not per challenge: at one challenge per
+// renewal a per-challenge write would wear out flash within hours. A reset skips the unused part
+// of the reservation, which keeps the counter monotonic.
 static bool persist(void) {
-    gate_nv nv = {g.session, g.used, g.chal, g.node};
+    gate_nv nv = {g.session, g.used, chal_top, g.node};
     ok = ok && port_nv_store(&nv);
     return ok;
 }
 
 void gate_fw_init(void) {
     gate_nv nv;
-    port_en_gate(false);
+    port_en_gate(0);
     memset(&g, 0, sizeof g);
     gate_drop(&g);
     have_t1 = false;
+    memset(t1, 0, sizeof t1);
     ok = port_nv_load(&nv);
     if (!ok) return;
     g.session = nv.session;
     g.used = nv.used;
-    g.chal = nv.chal;
+    g.chal = chal_top = nv.chal;
     gate_boot(&g, nv.node, 0);
     last_rb = port_now();
 }
@@ -58,12 +69,21 @@ void gate_fw_poll(void) {
     gate_frame f, out;
     char line[32];
     uint32_t now = port_now(), c;
+    uint8_t origin, flags, cf[8];
 
     while (ok && port_up_recv(&f)) {
         switch (f.id) {
         case UP_CHAL_REQ:
-            c = gate_challenge(&g, now);
-            if (persist()) { out = gate_raw(UP_CHAL, &c, 4); port_up_send(&out); }
+            c = gate_challenge(&g, now, GATE_W_MS);
+            if (c > chal_top) {
+                if (c > UINT32_MAX - GATE_CHAL_CHUNK) { ok = false; break; }   // counter spent: fail closed
+                chal_top = c + GATE_CHAL_CHUNK - 1;
+                if (!persist()) break;
+            }
+            memcpy(cf, &c, 4);
+            gate_chal_mac(port_key(), c, cf + 4);
+            out = gate_raw(UP_CHAL, cf, 8);
+            port_up_send(&out);
             break;
         case UP_TOKEN1:
             have_t1 = f.len == 6;
@@ -73,9 +93,12 @@ void gate_fw_poll(void) {
             if (!have_t1 || f.len != 8) break;
             have_t1 = false;
             memcpy(&c, t1 + 2, 4);
+            origin = t1[0];
+            flags = t1[1];
+            memset(t1, 0, sizeof t1);
             // Store the new node id before the rotation leaves: after a crash in between, the
             // gate cannot reach the drive and stays disabled until a verified flush.
-            if (gate_token(&g, port_key(), t1[0], t1[1], c, f.data, now, GATE_W_MS, GATE_T_MS, &out) == GATE_ROTATE &&
+            if (gate_token(&g, port_key(), origin, flags, c, f.data, now, GATE_T_MS, &out) == GATE_ROTATE &&
                 persist())
                 port_down_send(&out);
             break;
@@ -89,5 +112,5 @@ void gate_fw_poll(void) {
         port_uart_write("r axis0.controller.input_vel\n");
         last_rb = now;
     }
-    port_en_gate(ok && gate_lease_ok(&g, now));
+    port_en_gate(ok ? gate_enable_for(&g, now) : 0);
 }

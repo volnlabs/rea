@@ -230,40 +230,55 @@ static void tokens() {
     gate_frame f;
     uint8_t mac[8], bad[8];
 
-    gate_token_mac(KEY, A, 0, 1, mac);
-    check(gate_token(&g, KEY, A, 0, 1, mac, 0, W, T, &f) == GATE_REJECT, "T1 token with no open challenge rejected");
+    // Vectors produced by Python's hmac (gate/authority.py): both sides agree on layout and byte order.
+    uint8_t vt[8], vk[32], vc[8];
+    const float quarter = 0.25f;
+    gate_token_mac(KEY, 1, GATE_OVERLAP, 0x01020304, vt);
+    gate_session_key(KEY, 1, 0x01020304, vk);
+    std::memcpy(vc, &quarter, 4);
+    gate_cmd_mac(vk, 5, vc, vc + 4);
+    uint8_t vg[4];
+    gate_chal_mac(KEY, 0x01020304, vg);
+    check(hex(vt, 8) == "df76ba38f2d3efbb" && hex(vk, 32) == "449f553da026f01fab96eb03a9b4ffef243dfb6fd51a328e0f6b528d1708e50d" &&
+          hex(vc, 8) == "0000803eeffe5bc6" && hex(vg, 4) == "e5981d30",
+          "M3 token tag, session key, command tag and challenge tag match gate/authority.py");
 
-    uint32_t c = gate_challenge(&g, 0);
+    gate_token_mac(KEY, A, 0, 1, mac);
+    check(gate_token(&g, KEY, A, 0, 1, mac, 0, T, &f) == GATE_REJECT, "T1 token with no open challenge rejected");
+
+    uint32_t c = gate_challenge(&g, 0, W);
     gate_token_mac(KEY, A, 0, c + 1, mac);
-    check(gate_token(&g, KEY, A, 0, c + 1, mac, 1, W, T, &f) == GATE_REJECT, "T2 token for a different challenge rejected");
+    check(gate_token(&g, KEY, A, 0, c + 1, mac, 1, T, &f) == GATE_REJECT, "T2 token for a different challenge rejected");
     gate_token_mac(KEY, A, 0, c, mac);
     std::memcpy(bad, mac, 8);
     bad[7] ^= 1;
-    check(gate_token(&g, KEY, A, 0, c, bad, 1, W, T, &f) == GATE_REJECT, "T3 token with a wrong tag rejected");
-    check(gate_token(&g, KEY, A, GATE_OVERLAP, c, mac, 1, W, T, &f) == GATE_REJECT, "T4 token with a changed flag rejected");
-    check(gate_token(&g, KEY, A, 0, c, mac, W, W, T, &f) == GATE_REJECT, "T5 token at the end of the window W rejected");
-    check(gate_token(&g, KEY, A, 0, c, mac, W - 1, W, T, &f) == GATE_ROTATE, "T6 valid token inside W accepted");
+    check(gate_token(&g, KEY, A, 0, c, bad, 1, T, &f) == GATE_REJECT, "T3 token with a wrong tag rejected");
+    check(gate_token(&g, KEY, A, GATE_OVERLAP, c, mac, 1, T, &f) == GATE_REJECT, "T4 token with a changed flag rejected");
+    check(gate_token(&g, KEY, A, 0, c, mac, W, T, &f) == GATE_REJECT, "T5 token at the end of the window W rejected");
+    c = gate_challenge(&g, 51, W);
+    gate_token_mac(KEY, A, 0, c, mac);
+    check(gate_token(&g, KEY, A, 0, c, mac, 51 + W - 1, T, &f) == GATE_ROTATE, "T6 valid token inside W accepted");
     down(f);
     cs.service_stack();
-    check(gate_token(&g, KEY, A, 0, c, mac, W - 1, W, T, &f) == GATE_REJECT, "T7 the same token a second time rejected");
+    check(gate_token(&g, KEY, A, 0, c, mac, 51 + W - 1, T, &f) == GATE_REJECT, "T7 the same token a second time rejected");
 
-    c = gate_challenge(&g, 60);
+    c = gate_challenge(&g, 110, W);
     gate_token_mac(KEY, A, 0, c, mac);
     uint32_t sess = g.session;
-    check(gate_token(&g, KEY, A, 0, c, mac, 61, W, T, &f) == GATE_RENEWED && g.session == sess && g.expiry == 61 + T,
+    check(gate_token(&g, KEY, A, 0, c, mac, 111, T, &f) == GATE_RENEWED && g.session == sess && g.expiry == 111 + T,
           "T8 renewal by the holder extends the lease without rotating");
 
-    c = gate_challenge(&g, 70);
+    c = gate_challenge(&g, 120, W);
     gate_token_mac(KEY, B, 0, c, mac);
     gate_boot(&g, g.node, other);
     // The gate clock restarts at reset, so "now" is small again and the window check alone would pass.
-    check(gate_token(&g, KEY, B, 0, c, mac, 1, W, T, &f) == GATE_REJECT, "T9 a challenge issued before a gate reset cannot be redeemed");
+    check(gate_token(&g, KEY, B, 0, c, mac, 1, T, &f) == GATE_REJECT, "T9 a challenge issued before a gate reset cannot be redeemed");
 
     // Commands.
     float& tq = axes[0].controller_.input_torque_;
-    c = gate_challenge(&g, 80);
+    c = gate_challenge(&g, 80, W);
     gate_token_mac(KEY, A, 0, c, mac);
-    gate_token(&g, KEY, A, 0, c, mac, 81, W, T, &f);
+    gate_token(&g, KEY, A, 0, c, mac, 81, T, &f);
     down(f);
     cs.service_stack();
     Ctl a(A, c);
@@ -312,8 +327,9 @@ static void handover() {
     cs.service_stack();
     readback(g);
     bool on = true;
+    bool armed = gate_enable_for(&g, 40) == 60;   // A's lease ends at 100, B's at 140: the earlier one
     for (uint32_t t = 40; t < 100; ++t) on = on && gate_lease_ok(&g, t);
-    check(on && tq == 0.2f && !g.confirmed, "H1 overlap: enable stays high on A's live lease while B is unconfirmed");
+    check(on && armed && tq == 0.2f && !g.confirmed, "H1 overlap: enable stays high on A's live lease while B is unconfirmed");
     check(!gate_forward(&g, A, 0.9f, &f), "H2 A's commands are not forwarded during the overlap");
     check(!gate_lease_ok(&g, 100), "H3 A's lease ends before B confirms: enable drops");
 
@@ -325,8 +341,9 @@ static void handover() {
     down(f);
     on = gate_lease_ok(&g, 59);
     readback(g);
+    on = on && g.prev < 0 && gate_enable_for(&g, 60) == 80;  // confirmation ends the overlap at once
     for (uint32_t t = 60; t < 140; ++t) on = on && gate_lease_ok(&g, t);
-    check(on && tq == -0.1f && g.prev < 0 && !gate_lease_ok(&g, 140),
+    check(on && tq == -0.1f && !gate_lease_ok(&g, 140),
           "H4 B confirms during the overlap: no gap, then enable follows B's lease alone");
 
     g = a_confirmed(true);
@@ -354,13 +371,66 @@ static void handover() {
     check(!gate_lease_ok(&g, 41), "H8 without the overlap flag a switch drops enable (revocation)");
 }
 
+// ---- 32-bit clock wrap (gate core) ----
+// Found by review, not by the tests above: before gate_tick, an expired lease compared as live
+// again 2^31 ticks later, and an unused challenge reopened 2^32 ticks later.
+static void wrap() {
+    enum { A = 0, B = 1, W = 50, T = 100 };
+    const uint64_t other = 1ull << axes[1].config_.can.node_id;
+    const uint32_t half = 0x80000000u;
+    gate_frame f;
+    uint8_t mac[8];
+    auto fresh = [&](uint32_t t0) {  // A granted at t0, commanding, confirmed
+        gate g;
+        std::memset(&g, 0, sizeof g);
+        gate_boot(&g, axes[0].config_.can.node_id, other);
+        gate_grant(&g, A, t0, T, false, &f);
+        down(f);
+        cs.service_stack();
+        gate_forward(&g, A, 0.2f, &f);
+        down(f);
+        readback(g);
+        return g;
+    };
+
+    gate g = fresh(0);
+    bool off = !gate_lease_ok(&g, T);
+    for (uint32_t t = half; t < half + 2 * T; ++t) off = off && !gate_lease_ok(&g, t);
+    check(off && g.lapsed, "W1 an expired lease stays dead 2^31 ticks later");
+
+    g = fresh(0xFFFFFFF0u);
+    bool on = true;
+    for (uint32_t i = 0; i < T; ++i) on = on && gate_lease_ok(&g, 0xFFFFFFF0u + i);
+    check(on && !gate_lease_ok(&g, 0xFFFFFFF0u + T), "W2 a lease that spans the wrap runs its exact length");
+
+    g = fresh(0);
+    uint32_t c = gate_challenge(&g, 10, W);
+    gate_token_mac(KEY, B, 0, c, mac);
+    gate_lease_ok(&g, 10 + W);          // the firmware loop observes the window closing
+    check(gate_token(&g, KEY, B, 0, c, mac, 20 /* 2^32 ticks later */, T, &f) == GATE_REJECT,
+          "W3 an unused challenge stays dead when the clock comes round again");
+
+    g = fresh(0);
+    gate_grant(&g, B, 40, T, true, &f);  // overlap; B never confirms but keeps renewing
+    down(f);
+    cs.service_stack();
+    off = true;
+    for (uint32_t t = 90; t < half + 200; t += 50) {
+        gate_grant(&g, B, t, T, true, &f);
+        if (t >= T) off = off && !gate_lease_ok(&g, t);
+    }
+    check(off && g.prev < 0 && g.holder == B, "W4 an ended previous lease never supports the output again");
+}
+
 // ---- Firmware loop (gate/gate_fw.c) on a host port ----
 static uint32_t p_now;
 static std::deque<gate_frame> p_up;
 static std::vector<gate_frame> p_up_tx;
 static std::string p_line;
 static bool p_have_line, p_en, p_nv_have, p_nv_ok = true;
+static uint32_t p_en_until;   // the one-shot's deadline, for the stalled-firmware check
 static gate_nv p_nv;
+static uint32_t p_nv_writes;
 extern "C" {
 uint32_t port_now(void) { return p_now; }
 bool port_up_recv(gate_frame* f) {
@@ -378,9 +448,9 @@ bool port_uart_line(char* buf, int n) {
     p_have_line = false;
     return true;
 }
-void port_en_gate(bool on) { p_en = on; }
+void port_en_gate(uint32_t ms) { p_en = ms > 0; p_en_until = p_now + ms; }
 bool port_nv_load(gate_nv* nv) { if (p_nv_have) *nv = p_nv; return p_nv_have; }
-bool port_nv_store(const gate_nv* nv) { if (p_nv_ok) p_nv = *nv; return p_nv_ok; }
+bool port_nv_store(const gate_nv* nv) { if (p_nv_ok) { p_nv = *nv; ++p_nv_writes; } return p_nv_ok; }
 const uint8_t* port_key(void) { return KEY; }
 }
 static void fw_run(uint32_t ms) {
@@ -392,7 +462,9 @@ static bool fw_chal(uint32_t* c) {
     gate_fw_poll();
     if (p_up_tx.empty()) return false;
     std::memcpy(c, p_up_tx.back().data, 4);
-    return true;
+    uint8_t want[4];   // the authority's check: it mints only for a challenge the gate tagged
+    gate_chal_mac(KEY, *c, want);
+    return p_up_tx.back().len == 8 && !std::memcmp(p_up_tx.back().data + 4, want, 4);
 }
 static void fw_token(uint8_t origin, uint8_t flags, uint32_t c, const uint8_t* key = KEY) {
     uint8_t a[6] = {origin, flags}, mac[8];
@@ -418,7 +490,9 @@ static void firmware() {
     p_now = 1000;
     gate_fw_init();
 
-    check(fw_chal(&c) && p_nv.chal == c, "FW1 challenge is stored before it is sent");
+    check(fw_chal(&c) && p_nv.chal >= c, "FW1 challenge carries the gate's tag and is covered by stored state before it is sent");
+    uint32_t again = 0;
+    check(fw_chal(&again) && again == c, "FW1a a second request re-announces the open challenge: it cannot cancel it");
     fw_token(B, 0, c, wrong);
     check(g->holder < 0, "FW2 token under the wrong key rejected");
     fw_token(A, 0, c);
@@ -444,13 +518,23 @@ static void firmware() {
     p_up.push_back(b.cmd(-0.1f));
     fw_run(12);
     check(p_en && tq == -0.1f, "FW8 B's command installed and read back: EN_GATE high, torque is B's");
+    check(p_en_until == p_now + (g->expiry - p_now) && g->expiry - p_now <= T_MS,
+          "FW8a EN_GATE one-shot is armed for exactly the time left on the lease (a hung loop cannot hold it)");
 
+    fw_run(T_MS / 2);
+    fw_chal(&c);
+    fw_token(B, 0, c);
+    fw_run(T_MS - 1);
+    check(p_en && g->session == sess + 1, "FW8b renewal inside the lease: EN_GATE stays high past the first expiry, no rotation");
     fw_run(T_MS);
-    check(!p_en, "FW9 no renewal: EN_GATE low after the lease, with no message to the gate");
+    check(!p_en && g->lapsed, "FW9 no renewal: EN_GATE low after the lease, with no message to the gate");
+    p_up.push_back(b.cmd(-0.3f));
+    fw_run(12);
+    check(!p_en && tq == -0.1f, "FW9a a lapsed holder's commands are not forwarded");
     fw_chal(&c);
     fw_token(B, 0, c);
     fw_run(1);
-    check(p_en && g->session == sess + 1, "FW10 renewal token: EN_GATE high again without a rotation");
+    check(p_en && g->session == sess + 1, "FW10 new token for the lapsed holder: EN_GATE high again, same session, no rotation");
 
     fw_chal(&c);
     uint32_t expiry = g->expiry;
@@ -459,14 +543,21 @@ static void firmware() {
     check(g->expiry == expiry, "FW11 token redeemed after the window W is rejected");
 
     fw_chal(&c);
-    uint32_t chal = g->chal;
+    uint32_t chal = g->chal, writes = p_nv_writes;
+    for (int i = 0; i < 20; ++i) { fw_run(W_MS); fw_chal(&c2); }
+    check(c2 == chal + 20 && p_nv_writes == writes, "FW11a 20 more challenges cost no storage write (reserved ahead)");
+    fw_chal(&c);
     gate_fw_init();
     fw_token(B, 0, c);
-    check(!p_en && g->holder < 0 && g->chal == chal && g->session == sess + 1 && g->node == p_nv.node,
+    check(!p_en && g->holder < 0 && g->chal >= c && g->session == sess + 1 && g->node == p_nv.node,
           "FW12 gate reset: no lease, counters and node id reloaded, pre-reset challenge dead");
+    check(fw_chal(&c2) && c2 > c, "FW12a challenges after a reset are above every challenge sent before it");
+    fw_run(W_MS);
 
     p_nv_ok = false;
-    check(!fw_chal(&c), "FW13 storage write fails: no challenge issued");
+    bool none = true;
+    for (int i = 0; i < 1100 && none; ++i) { fw_run(W_MS); none = !fw_chal(&c) || c <= p_nv.chal; }
+    check(none && !fw_chal(&c), "FW13 storage write fails: no challenge above the stored reservation is ever sent");
     p_nv_ok = true;
     fw_run(1);
     check(!fw_chal(&c) && !p_en, "FW14 after a failed write the gate stays disabled until reset");
@@ -588,6 +679,7 @@ int main() {
     mac_vectors();
     tokens();
     handover();
+    wrap();
     firmware();
 
     std::printf("%s: %d failure(s)\n", failures ? "FAILED" : "ALL CHECKS AS EXPECTED", failures);

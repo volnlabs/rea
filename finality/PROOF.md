@@ -98,7 +98,9 @@ still be redeemed up to W ticks later.
    replaces the separate "fresh setpoint before re-grant" rule.
 3. Challenge unpredictability is abstracted by letting the authority issue tokens only for
    the gate's *current* challenge. Stockpiling tokens for future nonces is excluded by
-   construction, so the real protocol needs unpredictable nonces.
+   construction, so the real protocol needs unpredictable nonces, or a challenge the authority
+   can verify came from the gate. The gate code does the second (`gate_chal_mac`); its first
+   version did neither. See "Finding: tokens for future challenges" below.
 4. One global tick: the gate clock is the time base and t_c is read on it. **Clock drift**
    between the authority service and the gate is not modelled; with rate ratio ρ, scale
    the bound accordingly.
@@ -414,8 +416,9 @@ Limits of the handover result:
 - **Exact-effect grant sets** (Actryn): grants are identities for one protected effect. With
   one gate per effect, the theorems apply per effect. Grant sets with alternate support
   across effects are not modelled.
-- **Refinement to gate firmware:** no gate firmware exists yet. When it does, its CAN/UART
-  handling should be checked against `Fenced.Step`, as the SIL does for the drive side.
+- **Refinement to gate firmware:** the firmware loop (`../odrive/gate/gate_fw.c`) exists and is
+  explored exhaustively at small bounds against the two finality properties (see "Bounded
+  exploration" below). There is still no proof that it refines `Fenced.Step`.
 - **Fairness-based liveness:** see above.
 
 **Rule necessity:** this file proves no counterexamples of its own. Each rule's necessity is
@@ -494,8 +497,8 @@ the window, the deadline is `t_c + W + T + δ`.
 - **Exact-effect authority**: a single protected effect. Grants are identities, not grant
   sets per effect with alternate support.
 - **Recovery semantics** (uncertain vs replay): only enumerated in `chain_model.py`.
-- **Refinement to code**: `GateRefinement.lean` models the command-commit boundary, but
-  nothing links it to gate firmware. Dd (downstream bound) is unmeasured and unbounded
+- **Refinement to code**: `GateRefinement.lean` models the command-commit boundary. The gate
+  firmware loop is checked by bounded exploration and tests, not linked to the model by proof. Dd (downstream bound) is unmeasured and unbounded
   under CAN bus-off.
 
 ## First hardware test: X3 (setpoint hijack) — not run, needs [AUTH]
@@ -537,17 +540,147 @@ SIL binary runs them against the ODrive code:
 | T1–T9 | token accepted only for the open challenge, inside W, once, with a valid tag and unchanged flags; a pre-reset challenge is dead even though the gate clock restarts |
 | C1–C6 | command accepted only under the holder's session key; no replay; 7 lost frames tolerated, 8 not; a spent failed-tag budget drops the holder |
 | H1–H8 | make-before-break: enable stays high only while both leases are live and the old holder was confirmed; confirmation ends the overlap; no overlap flag means revocation |
-| FW0–FW14 | `gate_fw.c` end to end on a host port: challenge stored before sent, rotation stored before sent, UART readback, EN_GATE, expiry without a message, renewal, reset, storage failure fails closed |
+| M3 | token tag, session key, command tag and challenge tag equal those of `gate/authority.py` (Python `hmac`): both sides agree on layout and byte order |
+| FW0–FW14 | `gate_fw.c` end to end on a host port: tagged challenge covered by stored state before it is sent, a second request re-announces it, rotation stored before sent, UART readback, EN_GATE one-shot armed for the time left on the lease, expiry without a message, a lapsed holder's commands dropped, renewal with and without a lapse, 20 challenges with no storage write, reset resumes above every earlier challenge, storage failure fails closed |
 
-`odrive/sil/mutate.py` applies 18 single-rule mutants to `gate.h`; each fails at least one check.
+| W1–W4 | 32-bit clock wrap: an ended lease, challenge or previous lease never comes back; a lease spanning the wrap runs its exact length |
 
-Differences from `FencedFinality.lean`, all on the conservative side:
+`odrive/sil/mutate.py` applies 28 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
+
+Differences from `FencedFinality.lean`:
 - overlap is opt-in per token (the model always overlaps from a confirmed holder);
 - the previous holder cannot renew during the overlap;
-- a gate reset closes the open challenge instead of advancing the counter.
+- a gate reset closes the open challenge and resumes the counter above everything sent before;
+- the used-id set is stored across resets (the model flushes at boot instead);
+- rotation is a CAN frame (`SET_AXIS_NODE_ID`) on the downstream bus, so it can be delayed, lost
+  or reordered like any other frame (`FiniteFence.lean` rotates over UART). Covered by the
+  exploration below, not by a proof;
+- time is a wrapping 32-bit counter (the model uses unbounded naturals). Covered by
+  `ClockWrap.lean`.
 
 There is no proof that the C code refines the model. The MAC scheme is a draft (one shared key,
-truncated tags).
+truncated tags). Known availability gaps, none affecting the bound: a token is two frames, so a
+node on the upstream bus can interleave its own first frame and spoil another's token; a spent
+failed-tag budget drops the holder; 62 holder changes use up the node ids until a verified flush,
+and the firmware loop has no flush path yet. `odrive/gate/authority.py` is the authority-service and controller side in
+Python; test M3 checks that both languages produce the same tags for the same inputs.
+
+**Finding: an ended lease came back when the clock wrapped (fixed, 2026-11-12).** The first gate
+core tested a deadline with `(int32_t)(expiry - now) > 0` every time it was asked. That is only
+right within 2^31 ticks of the deadline. Reproduced on the code: a lease that ended at tick 200
+tested as live again at tick 2^31 + 300 (24.8 days later at 1 ms per tick), with the retired
+holder's setpoint still confirmed, so EN_GATE would go high with no token. An unused challenge
+reopened the same way after 2^32 ticks. None of the tests or mutants at the time could see it,
+and the Lean model cannot express it (unbounded time). Fix: `gate_tick` marks a lease as lapsed, and clears a
+previous lease or a challenge, the first time it is seen expired. Only a new grant revives it. `ClockWrap.lean` proves the fix:
+
+| Theorem | Statement |
+|---|---|
+| `ClockWrap.live_iff` | within 2^31 ticks either side of the deadline, the wrapped test equals the true comparison |
+| `ClockWrap.zombie` | from 2^31 + 1 ticks after it ended, a lease tests as live again |
+| `ClockWrap.latch_sound` | with the latch, if the gate looks at the clock at least once every 2^31 − T ticks, a lease is held only while truly live, for any number of wraps |
+| `ClockWrap.no_latch_unsound` | the same schedule without the latch reports a dead lease as live |
+
+New obligation: the firmware loop must run at least once every 2^31 − max(T, W) ticks. The
+EN_GATE one-shot below covers a loop that stops altogether.
+
+**EN_GATE is a hardware one-shot, not a pin level.** `port_en_gate(ms)` arms a timer output for
+the time left on the lease the output rests on (`gate_enable_for`: the earlier of the two leases
+during an overlap). A firmware loop that hangs therefore cannot hold EN_GATE high past the lease.
+The one-shot itself is a hardware obligation (`../odrive/STM32_BREAK_GATE.md`).
+
+**Finding: tokens for future challenges (fixed, 2026-11-12).** The first firmware loop announced
+its challenge as a bare counter. The model's rule "the authority issues only for the gate's
+current challenge" then rested on nothing: a controller could show the authority the *next*
+counter value, receive a token for it while still authorised, and redeem it whenever the counter
+got there, long after `t_c + W + T`. This broke assumption 3 above in our own code. Fix: the
+challenge frame carries the gate's tag (`gate_chal_mac`, 32 bits of HMAC under the shared key)
+and the authority mints only for a tagged challenge (`authority.py: verify_challenge`). No random
+number generator is needed. The exploration shows both sides: with an authority that skips the
+check it finds a 19-step I1 violation (run on every `run.sh` as an expected counterexample); with
+the check, the same attack step is available to the adversary and never succeeds. A 32-bit tag
+can be guessed online with probability 2^-32 per attempt, so the authority must rate-limit
+requests; like the rest of the MAC scheme this is a draft.
+
+**Challenge handling (changed, 2026-11-12).** Two more problems in the first firmware loop,
+neither a finality violation:
+- every challenge caused a storage write. At one challenge per renewal that wears out MCU flash
+  within hours. The counter is now stored as a reserved ceiling (`GATE_CHAL_CHUNK` values per
+  write); a reset resumes above the ceiling, so values still never repeat;
+- every request replaced the open challenge, so a retired controller with upstream access could
+  cancel every other controller's token by requesting challenges. A request now re-announces the
+  open challenge until it is used or its window ends.
+
+**Bounded exploration of the firmware loop (`../odrive/sil/explore.c`, run).** The real
+`gate_fw.c` and `gate.h` are compiled into a search over an adversarial environment. Two
+properties are checked after every step:
+
+- **I1 (timed finality):** EN_GATE high and the drive's setpoint was authored by origin `o` ⇒
+  now < (last time the authority minted a token for `o`) + W + T;
+- **I2 (attribution):** EN_GATE high and the setpoint was authored by `o` ⇒ `o` is the gate's
+  holder, or its previous holder during a handover.
+
+"Authored by" is a ghost label carried from the upstream command frame to the drive model. The
+gate code never sees it.
+
+Environment, every choice adversarial: time; challenge requests; the authority minting a token
+for any origin with or without the overlap flag; a controller asking the authority for a token
+for the next, not yet issued, challenge; any minted token presented at any time, any number of
+times; tokens with a made-up tag; next command, replayed command or bad-tag command
+under any session key ever handed out; downstream frames delivered in any order, after any delay,
+or lost; UART answers late, current or missing; and one fault class per run: gate reset (clock
+restarts), crash right after a storage write, failed storage write, drive reboot to its default
+node id, firmware hang (only the one-shot acts).
+
+| Mode | Bounds | Result |
+|---|---|---|
+| Exhaustive, duplicate states pruned | W=1, T=3, 5 ticks, 2 origins, 2 challenges, 2 tokens, 2 frames on the bus, 2 commands per key; no fault and each of the 5 fault classes; clock started at 0, and 4 ticks before the wrap for no fault and gate reset | I1 and I2 hold in all 72,065,308 states (8 runs, 7.5 minutes) |
+| Seeded random walks | W=3, T=6, 60 ticks, 3 origins, 8 challenges, 12 tokens, 5,000,000 steps | I1 and I2 hold |
+
+The run is not vacuous: it reports how many states had EN_GATE high, how many of those rested on
+the previous holder's lease, and how many held a setpoint whose author's authority had run out
+with EN_GATE low (the X3 situation, blocked). It fails if any of the three counts is zero.
+
+What this is and is not:
+- it is the firmware's C code, not a model of it. The drive is a model: it accepts a frame only
+  if addressed to its current node id, which the F-series checks on real ODrive code;
+- it is bounded. It says nothing about longer runs, more controllers, or three frames in flight;
+- it does not cover the 2^31-tick wrap (too far for any bounded run; W1–W4 and `ClockWrap.lean`
+  do), a second node on the downstream bus, or a verified flush (the loop has no flush path);
+- states are compared by 128-bit fingerprint; a collision would hide states.
+
+**Which rules finality needs (mutants against the exhaustive search).** Each of
+the 28 mutants was run against the full exploration (exhaustive, then random walks), with the
+unit tests ignored. This sorts the rules by what they are for. It is bounded evidence: "not
+found" means no violation inside the bounds above, not that the rule is unnecessary.
+
+| Removing this rule breaks I1 or I2 in the search (16) |
+|---|
+| the holder's lease expires; a lapsed lease does not enable; expiry is latched |
+| node ids are not reused; readback must match the session tag |
+| a token needs a valid tag, the open challenge, and the freshness window |
+| a command needs a valid tag |
+| overlap only from a confirmed holder; the previous lease expires; the EN_GATE one-shot honours the previous lease |
+| the challenge reservation is stored before a challenge is sent; a reset resumes above it; the challenge tag is bound to its value |
+| the new node id is stored before the rotation is sent |
+
+| Not found by the search (11) | Why |
+|---|---|
+| expired challenge not latched | needs 2^32 ticks; caught by W3 |
+| reset forgets used ids | needs three sessions and a reset, beyond the exhaustive bounds; caught by X3m |
+| gate keeps serving after a failed storage write | needs a failed write and then a reset; the search injects one fault class per run; caught by FW13, FW14 |
+| old lease alone keeps energy on | in this code the previous holder cannot renew, so its lease ends inside its own bound. `Fenced.old_lease_alone_breaks` shows the rule is needed where it can |
+| commands forwarded from any origin | unreachable through the firmware loop, which passes the holder; guards the core's API |
+| command sequence not advanced | a replayed command has the same author as the original |
+| no failed-tag budget | bounds forgery attempts; forging a tag is not modelled |
+| lapsed holder's commands forwarded | changes the setpoint with EN_GATE low, same author |
+| overlap from a lapsed holder | second guard: the previous lease is cleared at the next tick anyway |
+| a request replaces the open challenge | availability |
+| confirmation does not end the overlap | promptness |
+
+One mutant, "token redeemable twice", did not finish: every extra redemption opens a new session,
+the state space outgrew this machine's memory, and the run was killed three times. Random walks
+did not find a violation; T7 and FW5 catch it.
 
 What this does **not** show: any timing, the EN_GATE wire, phase current or motion. "Energized
 torque" here means `input_torque_` while the gate's enable flag is high. P3a is "falsified if A's
