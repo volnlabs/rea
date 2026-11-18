@@ -10,6 +10,11 @@ uint32_t port_now(void);                          // ms, the gate's own monotoni
 bool port_up_recv(gate_frame* f);                 // upstream CAN, non-blocking
 void port_up_send(const gate_frame* f);
 void port_down_send(const gate_frame* f);         // downstream CAN: the only path to the drive
+// The two halves of a verified flush (C14). Each returns true only when it is certain.
+bool port_down_abort(void);                       // every downstream TX mailbox is empty, nothing on the wire
+// The drive was held in hardware reset (its nRST pin, not a command it could miss), the UART
+// receive buffer was emptied while it was held, and it is running again on its boot node id.
+bool port_drive_reset(void);
 void port_uart_write(const char* s);              // drive UART (ASCII protocol)
 bool port_uart_line(char* buf, int n);            // one complete line from the drive, non-blocking
 // The EN_GATE interlock output: high for at most `ms` from now, 0 = low now. Must be a hardware

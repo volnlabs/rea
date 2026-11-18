@@ -44,8 +44,14 @@ date. Check each listing against the "must have" column, because clone boards di
 - **Clone quality:** some v3.6 clones ship with locked or modified bootloaders, or omit the CAN
   transceiver. Confirm SWD access and the transceiver in the listing photos before buying.
 - **Gate MCU family:** an STM32 with two CAN controllers and a one-pulse timer output matches
-  `../gate/gate_fw.c` and `../STM32_BREAK_GATE.md`. The STM32 port of the board interface is
-  not written.
+  `../gate/gate_fw.c` and `../STM32_BREAK_GATE.md`. The board layer is written for the
+  NUCLEO-F446RE (`../gate/stm32/`), links, and passes a 14-step sequence in Renode's STM32F4
+  emulation. It has **never run on silicon**. Pins: PA11/PA12 CAN1 (upstream), PB12/PB13 CAN2
+  (drive), PA9/PA10 USART1 (drive UART), PA5 EN_GATE (one-shot timer output, also the board
+  LED), PB0 open-drain to the drive's nRST (needed for the verified flush).
+- **First power-up of the gate board:** alone, nothing wired to a drive. Check with a logic
+  analyzer that PA5 is low after reset and that a granted lease gives one pulse of the lease
+  length that ends by itself with the debugger halting the CPU. Only then wire EN_GATE.
 - **Gate storage endurance:** the firmware writes storage once per holder change and once per
   `GATE_CHAL_CHUNK` challenges (default 1024). MCU flash is rated around 10,000 erase cycles per
   sector, so the port needs wear levelling across a sector, or FRAM. Measure the write time: it

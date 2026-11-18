@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Re-run every proof, model check and software test in this repo. Exits non-zero on any failure.
 # Needs: elan (Lean toolchain from ./lean-toolchain), python3, gcc, g++, git, network on first run.
-# Optional: clang with an ARM target (Cortex-M compile check).
+# Optional: clang with an ARM target and lld (Cortex-M compile check, STM32F4 image); Renode
+# (runs that image in emulation).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,6 +29,16 @@ if echo 'int x;' | clang --target=arm-none-eabi -mcpu=cortex-m4 -x c -c - -o "$t
       -I odrive/sil/stubs/arm -I odrive/gate -c odrive/gate/gate_fw.c -o "$tmp/gate_fw.o"
     echo "$cpu: $(llvm-size "$tmp/gate_fw.o" | awk 'NR==2 {print $1 " bytes code, " $2 + $3 " bytes RAM"}')"
   done
+  # Link the real STM32F4 image (board layer + startup, no libc) and run it in Renode's STM32F4
+  # model through one whole sequence. Emulation, not silicon.
+  echo "== gate firmware, STM32F4 image"
+  if command -v ld.lld >/dev/null; then
+    odrive/gate/stm32/build.sh "$tmp/stm32"
+    if command -v renode >/dev/null; then odrive/gate/stm32/renode_test.sh | tail -1
+    else echo "Renode run skipped: renode not installed"; fi
+  else
+    echo "skipped: no ld.lld"
+  fi
 else
   echo "skipped: clang has no ARM target"
 fi

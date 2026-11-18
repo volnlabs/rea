@@ -3,13 +3,39 @@
 Status: outline and evidence map, not prose. Every claim below points to an artifact in this
 repo. Nothing has been run on motor hardware.
 
+## Option being explored (2026-11-18, not decided)
+
+Whether the paper can stand without a drive. Three possible stages, each a complete paper on
+its own:
+
+| Stage | What the paper is | Hardware | Status |
+|---|---|---|---|
+| **A** | A verification paper: the mechanised bound, rule necessity, the gate's C code explored against the bound, SIL on the stock drive's real CAN source, the STM32 image in emulation, and the bugs each layer found that the layer above could not | none | evidence exists |
+| **A+ (cheap upgrade)** | A plus measurements on the gate board alone: EN_GATE pulse length, the cut-off with the CPU halted by a debugger, gate-side latencies, flash write times in the handover path. Turns "emulation only" into "measured on silicon, without a drive" | NUCLEO-F446RE (two CAN transceivers only if CAN is exercised; the EN_GATE and halt measurements need none), logic analyzer | not started |
+| **C (full)** | The paper as originally planned: X3 on a motor, δ, fence bench | ODrive v3.6 clone, motor, supply | not started |
+
+If stage A were chosen, it would have to state plainly:
+- δ (C13) is an **assumption**: the bound is `t_c + W + T + δ` with δ unmeasured, and TI does not
+  bound it in the datasheet.
+- The setpoint hijack is shown in proofs and on the drive's real CAN source in SIL (C6, C25),
+  **not** on a motor (C18 open).
+- Likely venue: formal methods or verification, or a workshop. A systems, robotics or safety venue is
+  likely to ask for the motor; that is stage C.
+- Kill criterion 3 ("no better than a safety-MCU baseline") is answered in proofs and SIL only.
+
+Not checked: whether VESC or moteus firmware would serve as a second stock drive (open
+firmware, runtime-changeable CAN id, persistent setpoint, readback). Worth an hour before
+buying hardware for stage C.
+
 ## Working title
 
 *When the Gate Is Not the Actuator: Mechanised Timed Finality for Controller Handover*
 
 "Energy is not authority" stays as the slogan for contribution 1, but it no longer carries the
 title: Das (*The Last Gate Before Motion*, Zenodo, Oct 2026) already states that a continuing
-effect needs continuing authority. Our case is the one his theorem assumes away.
+effect needs continuing authority. Our case is the one his theorem assumes away, and the one his
+later drafts leave to the implementer ("must separately reconcile already buffered or applied
+commands"). Cite the UAS draft for gate-side epoch handover and expiry-bounded exposure.
 
 The earlier title, "Revoked but Still Moving…", collides with IETF
 draft-das-finality-bound-revocation ("Revoked but Still Executable"). See
@@ -98,7 +124,7 @@ specifics.
 | 5 | Fencing protocol and composed theorem; clock drift; recoverability | `FencedFinality.lean` |
 | 6 | Necessity of each rule (counterexample table) | `FinalityProduct`, `GateRefinement`, `FiniteFence`, `Impossibility` §Fence |
 | 7 | Realisation on ODrive v3: node-id fence, filter-renewal window, paired-tag readback, EN_GATE interlock | `odrive/`, `odrive/sil/` |
-| 8 | Evaluation: SIL now, including X3 on the gate core; hardware (fence bench, δ, X3 on a motor) pending | `odrive/bench/`, `finality/PROOF.md` X3 |
+| 8 | Evaluation (as it would read under stage A): SIL on the drive's unmodified CAN code (X3 included); exhaustive and random exploration of the gate firmware against the bound (single and paired faults, flush); mutation analysis sorting rules by necessity; STM32 image in Renode; the four bugs found (clock wrap, future challenges, interrupt-counted clock, failed write then reset). Hardware (A+, C) as future work | `odrive/sil/`, `odrive/gate/stm32/`, `finality/PROOF.md` |
 | 9 | Related work; limitations; kill criteria | below |
 
 ## Claims and evidence
@@ -140,12 +166,17 @@ Evidence types:
 | C26 | The gate core accepts a token only for the open challenge, inside W, once, with a valid tag; commands are accepted only under the holder's session key, each sequence number once; a spent failed-tag budget drops the holder | E | `odrive/sil` T1–T9, C1–C6 |
 | C27 | Make-before-break in the gate core: enable stays high across a handover only while both leases are live and the old holder was confirmed; confirmation ends the overlap | E | `odrive/sil` H1–H8 (code counterpart of C22, C23) |
 | C28 | A firmware loop over a board interface runs the whole sequence (challenge, token, rotation, authenticated command, UART readback, EN_GATE, expiry, reset, storage failure) on a host port against unmodified ODrive CAN code | E | `odrive/gate/gate_fw.c`; `odrive/sil` FW0–FW14 |
-| C29 | Every one of 28 mutants of the gate core and firmware loop fails at least one SIL check | E | `odrive/sil/mutate.py` |
+| C29 | Every one of 32 mutants of the gate core and firmware loop fails at least one SIL check | E | `odrive/sil/mutate.py` |
 | C30 | A deadline test on a wrapping 32-bit clock revives an ended lease 2^31 ticks later (found in our own gate core, reproduced, fixed); latching expiry is sound for any number of wraps if the gate looks at the clock at least once every 2^31 − T ticks | P, E | `ClockWrap.live_iff`, `zombie`, `latch_sound`, `no_latch_unsound`; `odrive/sil` W1–W4 |
 | C31 | Timed finality (I1) and attribution (I2) hold for the gate firmware's C code in every reachable state of a bounded adversarial environment: delayed, lost and reordered downstream frames, replayed and forged tokens and commands, stale readback, gate reset, crash after a storage write, failed write, drive reboot, firmware hang | M (on code) | `odrive/sil/explore.c`: exhaustive at small bounds, random walks at larger ones |
 | C32 | Which gate rules finality needs: removing one breaks I1 or I2 in the explored space; the rest are hardening, availability or promptness | M (on code) | `mutate.py` against `explore.c`; table in `PROOF.md` |
 | C33 | EN_GATE held by a hardware one-shot armed with the time left on the lease: a hung firmware loop cannot extend the output past the lease | M (on code), A | `gate_enable_for`; `explore.c` fault "firmware hangs"; the timer is a hardware obligation |
 | C35 | A predictable challenge that the authority cannot verify breaks finality: a token obtained for a future challenge outlives its holder's revocation (found in our own firmware loop; fixed with a gate-tagged challenge, no RNG needed) | M (on code) | `explore.c` with `-DAUTHORITY_UNCHECKED`: 19-step I1 counterexample; mutant "challenge tag not bound to its value" |
+| C36 | The firmware loop performs a verified flush when node ids run out (only an authentic token can trigger it; TX abort and drive reset come before the cleared id set is stored), and finality holds across flushes in the explored space | M (on code), E | `odrive/sil` FW15–FW18; `explore.c` flush configuration; mutants "flush stored before the drive is reset", "flush without a drive reset" |
+| C37 | Finality holds with any two different fault classes in one run (reset, crash after write, failed write, drive reboot, firmware hang) | M (on code) | `explore.c -DFAULT_PAIRS` (`EXPLORE=deep`) |
+| C38 | A complete STM32F4 image of the gate (register-level board layer, no vendor library) links and passes a 14-step end-to-end sequence in Renode's STM32F4 model, including EN_GATE falling by the timer alone with the CPU halted | E (emulation only) | `odrive/gate/stm32/renode_test.sh` |
+| C39 | A gate clock counted by an interrupt stretches leases across a firmware stall (found in emulation in our own board layer, fixed with a free-running hardware counter) | E (emulation) | `port_stm32f4.c`; `PROOF.md` |
+| C40 | A key slot filled at provisioning but declared `const` lets the compiler delete the whole gate loop from the production image (found in our own board layer; build check and provisioning-style emulation now catch it) | E (build, emulation) | `odrive/gate/stm32/build.sh`, `renode_test.sh`; `PROOF.md` |
 | C34 | The gate firmware loop compiles for Cortex-M4 and Cortex-M0+ with no dependencies beyond the board interface, `memcpy`/`memmove`/`memset` and `strtof` (about 3 kB of code) | E (compile only) | `check.sh` |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 
@@ -156,8 +187,8 @@ Evidence types:
   explored against the finality properties, exhaustively only at small bounds (C31). The
   model and the code already differ in listed ways (`PROOF.md`), and one real bug (C30) sat
   in exactly such a difference: unbounded time in the model, a 32-bit clock in the code.
-  The STM32 port (CAN, UART, flash, clock, EN_GATE pin) does not exist, nothing is
-  timing-verified, and the code has never run on an MCU.
+  An STM32F4 board layer exists and passes an end-to-end sequence in Renode emulation (C38).
+  It has never run on an MCU, and nothing is timing-verified.
 - **Message authentication is a draft:** one shared HMAC key, tags truncated to 64 bits
   (tokens) and 32 bits (commands, with a failed-tag budget) to fit classic CAN. Not reviewed
   cryptography; C16 stays an assumption.
@@ -176,11 +207,11 @@ Evidence types:
 
 | Criterion | Status |
 |---|---|
-| A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. **Further narrowed (2026-11-12):** Das's *Last Gate Before Motion* publishes the final-gate architecture and continuing-effect authority as a paper theorem, under the assumption that the gate observes the pending output and checks atomically. Our claim is restricted to the case where that assumption fails. See `finality/RELATED_WORK.md` |
+| A plain reference monitor + sequence numbers proves the same | **Partly triggered at the mechanism level.** Device-side sequence numbers with a watchdog to a safe state are standard (PROFIsafe), and robot-side rejection of superseded leases exists (Spot). What remains: authority-handover semantics with persistent setpoints and a retired controller that keeps upstream access (C6: an energy-only gate fails), plus the machine-checked composed bound (C3). PROFIsafe's fixed 1:1 host–device binding does not cover handover. **Further narrowed (2026-11-12):** Das's *Last Gate Before Motion* publishes the final-gate architecture and continuing-effect authority as a paper theorem, under the assumption that the gate observes the pending output and checks atomically. Our claim is restricted to the case where that assumption fails. **Narrowed again (2026-11-13):** Das's UAS draft has epoch-fenced transactional handover at the gate and expiry-bounded offline exposure, and his later text names persisting downstream commands as something "the implementation must separately reconcile". We claim only the conjunction that closes that gap for an unmodified drive: id rotation toward the drive, readback before enable, the bound composed to the drive's output, energised handover, mechanised and explored code. See `finality/RELATED_WORK.md` |
 | The device cannot expose a defensible finality point | Pi 5 RP1: **triggered**. ODrive v3: **not triggered** (C8, C9), but δ (C13) is unbounded in the datasheet |
 | No better than a safety-MCU baseline | **Not triggered in proofs**: C6 (provenance) and C22 (energy stays on across a handover, which pause-and-replace cannot do). Needs X3 (C18) and a measured handover-overlap success rate on hardware |
 
-## Evaluation plan (hardware, pending)
+## Evaluation plan (hardware: stages A+ and C, pending)
 
 Hardware: ODrive v3.6-compatible board on fw 0.5.x, a CAN adapter, UART, a logic analyzer,
 and a low-voltage current-limited supply.
@@ -191,5 +222,14 @@ and a low-voltage current-limited supply.
 | δ distribution | EN_GATE↓ → gate-drive off, gate discharge |
 | X3 | setpoint hijack, baseline vs fenced gate, plus the X3-stuck variant |
 | X1, X2, X4, X5 | persistence, lease ≠ traffic, recovery replay, energy removal under livelock |
+
+Stage A+ (gate board only, no drive):
+
+| Experiment | Purpose |
+|---|---|
+| EN_GATE one-shot | pulse length against the lease; edge jitter |
+| Halted CPU | debugger halts the core mid-lease; EN_GATE must fall at the lease end (Renode S11 on silicon) |
+| Gate latencies | token to rotation frame; command to forwarded frame; readback to EN_GATE |
+| Flash write time | the storage write that sits in the handover path |
 
 Report every measurement as a measured distribution, never as a bound.

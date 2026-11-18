@@ -12,7 +12,8 @@
 // Obligations on the firmware around this core:
 //  - `session`, `used`, `chal` and `node` are stored non-volatile before they take effect (C24);
 //  - gate_flush may be called only after a verified flush: TX abort + drive reset (C14);
-//  - `now` comes from the gate's own monotonic clock, which is 32 bits and wraps. Expiry is
+//  - `now` comes from the gate's own monotonic clock, which must keep running while the firmware
+//    is stuck (a hardware counter, not a tick counted by an interrupt). It is 32 bits and wraps. Expiry is
 //    therefore latched (gate_tick): the firmware must call gate_lease_ok at least once every
 //    2^31 - max(T, W) ticks, and T and W must be below 2^30. Without the latch a lease that
 //    ended 2^31 ticks ago compares as live again;
@@ -33,7 +34,7 @@
 #include "gate_mac.h"
 
 enum { GATE_CMD_SET_NODE_ID = 0x006, GATE_CMD_SET_INPUT_VEL = 0x00D };  // ODrive CANSimple
-enum { GATE_REJECT = 0, GATE_RENEWED = 1, GATE_ROTATE = 2 };            // gate_token results
+enum { GATE_REJECT = 0, GATE_RENEWED = 1, GATE_ROTATE = 2, GATE_EXHAUSTED = 3 };  // gate_token results
 enum { GATE_OVERLAP = 1 };  // token flag: keep energy on the previous holder's lease (handover)
 #ifndef GATE_SEQ_WINDOW
 #define GATE_SEQ_WINDOW 8   // command sequence numbers accepted ahead of the expected one
@@ -188,6 +189,8 @@ static inline uint32_t gate_challenge(gate* g, uint32_t now, uint32_t W) {
 
 // Redeem a token. Accepted only for the open challenge, within its window, with a
 // valid tag, and only once. On GATE_ROTATE send `rot` downstream after storing the new state.
+// GATE_EXHAUSTED: the token was good but no fresh node id is left; nobody holds a lease now, and
+// only a verified flush makes the gate usable again.
 static inline int gate_token(gate* g, const uint8_t key[32], uint8_t origin, uint8_t flags, uint32_t chal,
                              const uint8_t mac[8], uint32_t now, uint32_t T, gate_frame* rot) {
     uint8_t want[8];
@@ -196,7 +199,7 @@ static inline int gate_token(gate* g, const uint8_t key[32], uint8_t origin, uin
     gate_token_mac(key, origin, flags, chal, want);
     if (!gate_eq(mac, want, 8)) return GATE_REJECT;
     gate_close_challenge(g);
-    if (!gate_grant(g, origin, now, T, flags & GATE_OVERLAP, rot)) return g->holder < 0 ? GATE_REJECT : GATE_RENEWED;
+    if (!gate_grant(g, origin, now, T, flags & GATE_OVERLAP, rot)) return g->holder < 0 ? GATE_EXHAUSTED : GATE_RENEWED;
     gate_session_key(key, origin, chal, g->ks);
     g->seq = 0;
     g->bad = 0;

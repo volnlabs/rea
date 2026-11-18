@@ -23,7 +23,8 @@
 //   - one fault class per run: the gate resets (clock restarts), crashes right after a storage
 //     write, a write fails, the drive reboots to its default node id with a zero setpoint, or the
 //     firmware hangs for some ticks (only the EN_GATE hardware one-shot acts).
-// Not modelled: verified flush (the firmware loop has no flush path), a second downstream node,
+// With -DNODE_IDS=n the gate has only n node ids, runs out, and flushes (verified flush taken as
+// correct hardware). Not modelled: a flush that does not really clear, a second downstream node,
 // the one-shot timer itself (taken as correct hardware).
 //
 // This is a bounded check of the C code, not a proof. Model of the drive: it accepts a frame
@@ -54,6 +55,9 @@ static void cached_hmac(const uint8_t* key, size_t klen, const uint8_t* msg, siz
 #endif
 #define GATE_RB_MS 1u
 #define GATE_CHAL_CHUNK 2u   // small, so both the reserved and the storing path are explored
+#ifdef NODE_IDS              // only ids 0 .. NODE_IDS-1 exist, so the search can run out of ids and flush
+#define GATE_RESERVED_IDS (~0ull << NODE_IDS)
+#endif
 #define GATE_SEQ_WINDOW 2
 #define GATE_MAX_BAD 2
 #include "gate_fw.c"
@@ -73,10 +77,20 @@ static void cached_hmac(const uint8_t* key, size_t klen, const uint8_t* msg, siz
 #ifndef NORIG
 #define NORIG 2        // controllers (origins)
 #endif
-enum { NFL = 2, MAX_SEQ = 2, D0 = 0, NEVER = -1000, PER = NORIG * 2, NSLOT = (MAX_CHAL + 1) * PER };
+#ifndef MAX_SEQ
+#define MAX_SEQ 2       // commands per session key
+#endif
+enum { NFL = 2, D0 = 0, NEVER = -1000, PER = NORIG * 2, NSLOT = (MAX_CHAL + 1) * PER };
 enum { F_RESET = 1, F_CRASH = 2, F_STORE = 4, F_DRIVE = 8, F_STALL = 16 };   // fault classes
-enum { MAX_STALL = 3 };
+#ifndef MAX_STALL
+#define MAX_STALL 3     // ticks the firmware may hang in one run
+#endif
 
+#ifdef NO_OVERLAP            // the authority never sets the overlap flag (used where ids are too few for a handover)
+#define FLAG_OK(f) (!(f))
+#else
+#define FLAG_OK(f) 1
+#endif
 // Token slot = challenge ordinal * PER + origin * 2 + flags, so the order of minting is not state.
 typedef struct { uint8_t minted, seq; } tok;
 typedef struct { gate_frame f; int8_t src; } flight;
@@ -107,6 +121,7 @@ static gate_frame up[2]; static int nup, iup;
 static int cur_src;                    // ghost: author of the upstream frame being processed
 static char line[16]; static bool have_line;
 static bool crashed, overflow, stalled;
+static uint64_t n_flush;
 
 // The authority mints only for a challenge carrying the gate's tag. With -DAUTHORITY_UNCHECKED it
 // mints for any value it is shown: the flaw of a predictable, unauthenticated challenge.
@@ -159,6 +174,22 @@ bool port_uart_line(char* buf, int n) {
 }
 void port_en_gate(uint32_t ms) { if (!crashed) { w.en = ms > 0; w.en_until = ms ? w.wt + ms : 0; } }
 bool port_nv_load(gate_nv* nv) { *nv = w.nv; return true; }
+// Verified flush, as correct hardware does it: nothing left on the bus, drive reset to its boot id
+// with no setpoint, no stale UART answer. A flush that only claims this is `FiniteFence.lean`'s
+// `unverified_flush_breaks`, not modelled here.
+bool port_down_abort(void) {
+    if (crashed) return false;
+    memset(w.fl, 0, sizeof w.fl);
+    w.nfl = 0;
+    return true;
+}
+bool port_drive_reset(void) {
+    if (crashed) return false;
+    w.d_node = D0; w.d_tag = 0; w.d_src = -1;
+    w.rb = 0; w.rb_have = 0;
+    n_flush++;
+    return true;
+}
 bool port_nv_store(const gate_nv* nv) {
     if (crashed) return false;
     if (w.fail_store) { w.fail_store = 0; return false; }
@@ -244,6 +275,9 @@ static void step(const char* fmt, int a, int b) {   // called with the action al
     if (stalled) { stalled = false; nup = 0; if (w.en && w.wt >= w.en_until) { w.en = 0; w.en_until = 0; } }   // only the one-shot acts
     else poll();
     fw_save();
+    // A correct gate opens at most one session per token. Cut runs that exceed that by a margin,
+    // so a gate broken in that respect still gives a finite search (the property is checked first).
+    if (!overflow && g.session > (uint32_t)NTOK + 2) { check(); overflow = true; }
     if (overflow) { overflow = false; n_pruned++; }
     else { check(); if (pick != -2) return; if (visit()) explore(); }
     depth--;
@@ -276,7 +310,7 @@ static void explore(void) {
     if (s.n_issued && s.ntk < NTOK)
         for (int k = 0; k < PER; ++k) {
             int i = (s.n_issued - 1) * PER + k, o = k >> 1;
-            if (!s.tk[i].minted)
+            if (!s.tk[i].minted && FLAG_OK(k & 1))
                 TRY((w.tk[i].minted = 1, w.ntk++, w.lastmint[o] = (int32_t)s.wt), "authority mints token: origin %d flags %d", o, k & 1);
         }
     // A controller shows the authority the *next* counter value with the last tag it saw, to get
@@ -336,11 +370,12 @@ static void explore(void) {
             TRY((snprintf(line, sizeof line, "%d", (int)s.d_tag), have_line = true, w.rb = 0, w.rb_have = 0), "readback answer, current value: %d", (int)s.d_tag, 0);
     }
     WEIGHT(1);
-    if (!s.fault_used) {
-        if (faults & F_RESET) TRY((w.fault_used = 1, reset_gate(), fw_save(), fw_load()), "gate reset", 0, 0);
-        if (faults & F_CRASH) TRY((w.fault_used = 1, w.crash_armed = 1), "gate will crash right after its next storage write", 0, 0);
-        if (faults & F_STORE) TRY((w.fault_used = 1, w.fail_store = 1), "next storage write will fail", 0, 0);
-        if (faults & F_DRIVE) TRY((w.fault_used = 1, w.d_node = D0, w.d_tag = 0, w.d_src = -1), "drive reboots", 0, 0);
+    {   // each enabled fault class at most once per run
+        const int can = faults & ~s.fault_used;
+        if (can & F_RESET) TRY((w.fault_used |= F_RESET, reset_gate(), fw_save(), fw_load()), "gate reset", 0, 0);
+        if (can & F_CRASH) TRY((w.fault_used |= F_CRASH, w.crash_armed = 1), "gate will crash right after its next storage write", 0, 0);
+        if (can & F_STORE) TRY((w.fault_used |= F_STORE, w.fail_store = 1), "next storage write will fail", 0, 0);
+        if (can & F_DRIVE) TRY((w.fault_used |= F_DRIVE, w.d_node = D0, w.d_tag = 0, w.d_src = -1), "drive reboots", 0, 0);
     }
     if ((faults & F_STALL) && s.n_stall < MAX_STALL && s.wt < HORIZON)
         TRY((w.n_stall++, w.wt++, stalled = true), "firmware hangs for a tick -> %d (no poll)", (int)s.wt + 1, 0);
@@ -349,7 +384,11 @@ static void explore(void) {
 }
 
 static void run(int fault_classes, uint32_t clock_base) {
-    static const char* const names[17] = {[0] = "none", [1] = "gate reset", [2] = "crash after storage write", [4] = "storage write fails", [8] = "drive reboot", [16] = "firmware hangs"};
+    static const char* const cls[5] = {"gate reset", "crash after write", "write fails", "drive reboot", "firmware hangs"};
+    char name[64] = "";
+    for (int b = 0; b < 5; ++b)
+        if (fault_classes >> b & 1) snprintf(name + strlen(name), sizeof name - strlen(name), "%s%s", *name ? " + " : "", cls[b]);
+    if (!*name) snprintf(name, sizeof name, "none");
     faults = fault_classes;
     base = clock_base;
     memset(tab, 0, cap * sizeof *tab);
@@ -364,7 +403,7 @@ static void run(int fault_classes, uint32_t clock_base) {
     fw_save();
     visit();
     explore();
-    printf("explore: fault %-25s clock base %#10x: %9llu states, max depth %d\n", names[fault_classes], clock_base, (unsigned long long)cnt, maxdepth);
+    printf("explore: fault %-32s clock base %#10x: %9llu states, max depth %d\n", name, clock_base, (unsigned long long)cnt, maxdepth);
     total += cnt;
 }
 
@@ -374,7 +413,7 @@ static uint32_t rnd(uint32_t n) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng 
 static void walks(long steps) {
     long done = 0, nwalk = 0;
     while (done < steps) {
-        faults = rnd(3) ? 0 : 1 << rnd(5);
+        faults = rnd(3) ? 0 : (1 << rnd(5)) | (1 << rnd(5));   // none, one or two fault classes
         base = rnd(2) ? 0xFFFFFFFFu - rnd(HORIZON) : 0;
         memset(&w, 0, sizeof w);
         w.nv.node = D0;
@@ -406,16 +445,28 @@ int main(void) {
 #ifdef AUTHORITY_UNCHECKED
     run(0, 0);                   // expected to end in a violation
 #else
+#ifdef FAULT_MASK                // one chosen combination of fault classes
+    run(FAULT_MASK, 0);
+#elif defined(FAULT_PAIRS)       // two different fault classes in one run
+    for (int a = 1; a <= 16; a *= 2)
+        for (int b = a * 2; b <= 16; b *= 2) run(a | b, 0);
+#else
     for (int f = 0; f <= 16; f = f ? f * 2 : 1) run(f, 0);
     run(0, 0xFFFFFFFCu);         // the gate clock wraps during the run
     run(F_RESET, 0xFFFFFFFCu);
 #endif
 #endif
+#endif
     printf("explore: enabled states %llu (of which on the previous holder's lease %llu), "
-           "stale setpoint held with EN_GATE low %llu, rotations delivered %llu, pruned (bus bound) %llu\n",
+           "stale setpoint held with EN_GATE low %llu, rotations delivered %llu, pruned (bus or session bound) %llu\n",
            (unsigned long long)n_en, (unsigned long long)n_overlap_en, (unsigned long long)n_blocked,
            (unsigned long long)n_rot, (unsigned long long)n_pruned);
+    printf("explore: verified flushes %llu\n", (unsigned long long)n_flush);
+#ifdef NODE_IDS      // with so few ids there is no room for a handover; a flush must have happened instead
+    if (!n_en || !n_flush || !n_blocked) { puts("EXPLORE: VACUOUS (a tracked situation was never reached)"); return 1; }
+#else
     if (!n_en || !n_overlap_en || !n_blocked) { puts("EXPLORE: VACUOUS (a tracked situation was never reached)"); return 1; }
+#endif
     printf("EXPLORE OK: I1 and I2 hold in all %llu explored states/steps (W=%u T=%u horizon=%d tokens=%d challenges=%d)\n",
            (unsigned long long)total, GATE_W_MS, GATE_T_MS, HORIZON, NTOK, MAX_CHAL);
     return 0;

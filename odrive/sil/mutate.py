@@ -50,15 +50,22 @@ MUTANTS = [
      "if (!g->confirmed && g->prev_expiry - now < left) left = g->prev_expiry - now;", ""),
     ("a request replaces the open challenge", "    if (g->chal_open) return g->chal;\n", ""),
     ("rotation sent before the new node id is stored",
-     "== GATE_ROTATE &&\n                persist())", "== GATE_ROTATE)", "gate_fw.c"),
+     "if (r == GATE_ROTATE && persist()) port_down_send(&out);", "if (r == GATE_ROTATE) port_down_send(&out);", "gate_fw.c"),
     ("challenge sent without a stored reservation", "                if (!persist()) break;\n", "", "gate_fw.c"),
     ("gate keeps serving after a failed storage write", "ok = ok && port_nv_store(&nv);", "ok = port_nv_store(&nv) || ok;", "gate_fw.c"),
     ("reset restarts the challenge counter", "g.chal = chal_top = nv.chal;", "chal_top = nv.chal;", "gate_fw.c"),
     ("challenge tag not bound to its value", "    uint8_t m[5] = {'G'}, h[32];\n    memcpy(m + 1, &chal, 4);", "    uint8_t m[5] = {'G'}, h[32];\n    (void)chal;"),
+    ("flush stored before the drive is reset",
+     "    if (!port_down_abort() || !port_drive_reset()) { ok = false; return; }\n    gate_flush(&g, GATE_DRIVE_BOOT_ID, GATE_RESERVED_IDS);\n    persist();",
+     "    gate_flush(&g, GATE_DRIVE_BOOT_ID, GATE_RESERVED_IDS);\n    if (!persist()) return;\n    if (!port_down_abort() || !port_drive_reset()) ok = false;",
+     "gate_fw.c"),
+    ("flush without a drive reset", "if (!port_down_abort() || !port_drive_reset()) { ok = false; return; }", "if (!port_down_abort()) { ok = false; return; }", "gate_fw.c"),
+    ("flush without a TX abort", "if (!port_down_abort() || !port_drive_reset()) { ok = false; return; }", "if (!port_drive_reset()) { ok = false; return; }", "gate_fw.c"),
+    ("flush on any rejected token", "if (r == GATE_EXHAUSTED) flush();", "if (r == GATE_EXHAUSTED || r == GATE_REJECT) flush();", "gate_fw.c"),
     ("confirmation does not end the overlap", "if (g->confirmed) { g->prev = -1; g->prev_expiry = 0; }", ""),
 ]
 
-survivors = explored = 0
+survivors = explored = timeouts = 0
 for name, old, new, *where in MUTANTS:
     if len(sys.argv) > 1 and sys.argv[1] not in name:
         continue
@@ -87,8 +94,12 @@ for name, old, new, *where in MUTANTS:
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)   # the whole group: a compiled test may still be running
             p.wait()
-            killed, how = True, "timeout"
-    print(f"{'killed  ' if killed else 'SURVIVED'}  {name}" + (f"  [{how}]" if killed else ""))
-    survivors += not killed
-print(f"{len(MUTANTS) - survivors}/{len(MUTANTS)} mutants killed ({explored} also found by exploration alone)")
+            killed, how = None, "timeout"
+    # A timeout is reported on its own: it is neither a kill nor a survivor.
+    label = "TIMEOUT " if killed is None else "killed  " if killed else "SURVIVED"
+    print(f"{label}  {name}" + (f"  [{how}]" if killed is not False else ""))
+    survivors += killed is False
+    timeouts += killed is None
+print(f"{len(MUTANTS) - survivors - timeouts}/{len(MUTANTS)} mutants killed, {timeouts} timed out"
+      f" ({explored} also found by exploration alone)")
 sys.exit(1 if survivors else 0)

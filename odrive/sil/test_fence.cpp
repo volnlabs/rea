@@ -430,7 +430,8 @@ static std::string p_line;
 static bool p_have_line, p_en, p_nv_have, p_nv_ok = true;
 static uint32_t p_en_until;   // the one-shot's deadline, for the stalled-firmware check
 static gate_nv p_nv;
-static uint32_t p_nv_writes;
+static uint32_t p_nv_writes, p_flushes;
+static bool p_abort_ok = true;
 extern "C" {
 uint32_t port_now(void) { return p_now; }
 bool port_up_recv(gate_frame* f) {
@@ -452,6 +453,15 @@ void port_en_gate(uint32_t ms) { p_en = ms > 0; p_en_until = p_now + ms; }
 bool port_nv_load(gate_nv* nv) { if (p_nv_have) *nv = p_nv; return p_nv_have; }
 bool port_nv_store(const gate_nv* nv) { if (p_nv_ok) { p_nv = *nv; ++p_nv_writes; } return p_nv_ok; }
 const uint8_t* port_key(void) { return KEY; }
+bool port_down_abort(void) { return p_abort_ok; }
+bool port_drive_reset(void) {   // a reset drive: boot node id (run.sh: GATE_DRIVE_BOOT_ID=3), no setpoint
+    axes[0].config_.can.node_id = 3;
+    axes[0].controller_.input_vel_ = axes[0].controller_.input_torque_ = 0.0f;
+    cs.service_stack();
+    p_have_line = false;
+    ++p_flushes;
+    return true;
+}
 }
 static void fw_run(uint32_t ms) {
     for (uint32_t i = 0; i < ms; ++i) { ++p_now; cs.service_stack(); gate_fw_poll(); }
@@ -561,6 +571,39 @@ static void firmware() {
     p_nv_ok = true;
     fw_run(1);
     check(!fw_chal(&c) && !p_en, "FW14 after a failed write the gate stays disabled until reset");
+
+    // Verified flush: use up the node ids with handovers, and keep going.
+    gate_fw_init();
+    uint32_t flushes = p_flushes;
+    int grants = 0;
+    bool off_at_flush = true;
+    uint8_t o = A;
+    for (int i = 0; i < 80; ++i) {
+        o = i & 1;
+        fw_run(W_MS);
+        if (!fw_chal(&c)) break;
+        uint32_t was = p_flushes;
+        fw_token(o, 0, c);
+        if (p_flushes != was) off_at_flush = off_at_flush && !p_en && g->holder < 0 && tq == 0.0f && p_nv.node == 3 && g->node == 3;
+        else if (g->holder == o) ++grants;
+    }
+    check(p_flushes == flushes + 1 && grants == 79, "FW15 80 handovers: one flush when the node ids ran out, every other token granted");
+    check(off_at_flush, "FW16 at the flush: EN_GATE low, no holder, drive reset to its boot id, cleared id set stored");
+    Ctl last(o, c);
+    p_up.push_back(last.cmd(0.4f));
+    fw_run(12);
+    check(p_en && tq == 0.4f, "FW17 after the flush the gate reaches the drive again: command installed, read back, EN_GATE high");
+
+    p_abort_ok = false;
+    flushes = p_flushes;
+    for (int i = 0; i < 80; ++i) {
+        fw_run(W_MS);
+        if (!fw_chal(&c)) break;
+        fw_token(i & 1, 0, c);
+    }
+    check(p_flushes == flushes && p_nv.used == ~0ull && !p_en && !fw_chal(&c),
+          "FW18 TX abort not confirmed: no drive reset, stored id set still full, gate disabled");
+    p_abort_ok = true;
 }
 
 int main() {

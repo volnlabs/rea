@@ -545,7 +545,7 @@ SIL binary runs them against the ODrive code:
 
 | W1–W4 | 32-bit clock wrap: an ended lease, challenge or previous lease never comes back; a lease spanning the wrap runs its exact length |
 
-`odrive/sil/mutate.py` applies 28 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
+`odrive/sil/mutate.py` applies 32 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
 
 Differences from `FencedFinality.lean`:
 - overlap is opt-in per token (the model always overlaps from a confirmed holder);
@@ -649,12 +649,66 @@ What this is and is not:
   do), a second node on the downstream bus, or a verified flush (the loop has no flush path);
 - states are compared by 128-bit fingerprint; a collision would hide states.
 
+**Verified flush in the firmware loop (added 2026-11-13).** After 62 holder changes the node ids
+are used up and the gate could serve nobody. The loop now flushes: when an *authentic* token
+finds no fresh id (`GATE_EXHAUSTED`; a forged token cannot trigger a drive reset), it drops
+EN_GATE, aborts the downstream TX mailboxes, resets the drive through its reset pin, and only
+then stores the cleared id set. That token is spent; the next one is served. The order is the
+point: storing first and crashing before the reset leaves a drive holding an old setpoint under
+an id the gate believes is fresh. FW15–FW18 test it on the ODrive stub (80 handovers, one
+flush). For exploration the gate is given two node ids, so the third token forces a flush:
+
+| Mode | Bounds | Result |
+|---|---|---|
+| Exhaustive, flush configuration | 2 node ids, W=1, T=3, 5 ticks (4 in `check.sh`), 3 tokens, 3 challenges, 1 command per key, no overlap flag; no fault and each fault class | I1 and I2 hold in all 46,138,107 states, with 2,709,994 verified flushes |
+| Exhaustive, two fault classes per run | main configuration; all 10 pairs of the 5 fault classes | I1 and I2 hold in all 226,244,970 states (`EXPLORE=deep`, not part of `check.sh`; pairs with a firmware hang use a 1-tick hang, the reset + hang pair did not finish with 3) |
+
+The flush itself is taken as correct hardware (nothing left on the bus, drive back on its boot
+id with no setpoint, no stale UART answer). A flush that only claims this is
+`FiniteFence.unverified_flush_breaks`.
+
+**STM32F4 image, built and run in emulation (added 2026-11-13).** `../odrive/gate/stm32/` holds a
+register-level board layer for an STM32F4 (written for NUCLEO-F446RE), start-up code and a linker
+script. `build.sh` links a complete image with clang and lld, no vendor library and no libc
+(about 5.8 kB of code, 284 bytes of RAM). `renode_test.sh` runs that image in Renode's STM32F4
+model and drives one whole sequence over the emulated CAN controllers, UART, flash and timers,
+starting from the production image with the key written into flash as provisioning would:
+
+| Check | What happens in emulation |
+|---|---|
+| S1–S3 | boots, polls the drive over UART, EN_GATE one-shot stopped, stored state in flash |
+| S4–S5 | tagged challenge on the upstream bus; a token under the wrong key sends nothing downstream |
+| S6–S8 | valid token → rotation frame on the downstream bus and the new node id in flash; authenticated command forwarded with the session tag |
+| S9–S10 | EN_GATE stays off until the drive's UART answer matches; then the one-shot runs for the time left on the lease |
+| S11–S12 | CPU halted for 300 ms: the timer stops by itself; the resumed firmware keeps EN_GATE off |
+| S13–S14 | after a reset the next challenge is above the earlier one, and the old token is dead |
+
+14/14 pass. **A finding from this run:** the first board layer counted milliseconds in a timer
+interrupt. With the CPU halted that clock stood still, so on resuming the gate still saw a live
+lease and would have re-armed EN_GATE for time that had already passed. The exploration's
+"firmware hangs" fault did not show this because its model clock keeps running by assumption.
+The clock is now a free-running hardware timer read directly, and the assumption is written
+into the obligations: the gate clock must not depend on the firmware making progress.
+
+**A second finding (2026-11-19):** the production image, built with a blank key slot to be
+filled at provisioning, had **no gate loop in it at all**. The key was declared `const`, so the
+compiler read "all 0xFF, never keyed" at build time and removed `gate_fw_poll` as dead code; a
+provisioned board would never have served. The emulation run missed it because it built with a
+demo key compiled in. Fixed by making the key slot non-`const`; `build.sh` now fails if
+`gate_fw_poll` is missing, and the Renode run uses the production image with the key written into
+flash before boot, as provisioning would. With the old declaration that run fails 7 of 14 checks.
+
+What the emulation does **not** show: anything about real silicon (pin electrical behaviour,
+bxCAN bit timing, flash programming times, the one-pulse output on the actual pin), any timing,
+or the drive. Renode's peripheral models are the reference here, not the reference manual. The
+image has never been flashed.
+
 **Which rules finality needs (mutants against the exhaustive search).** Each of
-the 28 mutants was run against the full exploration (exhaustive, then random walks), with the
+the 32 mutants was run against the full exploration (exhaustive, then random walks), with the
 unit tests ignored. This sorts the rules by what they are for. It is bounded evidence: "not
 found" means no violation inside the bounds above, not that the rule is unnecessary.
 
-| Removing this rule breaks I1 or I2 in the search (16) |
+| Removing this rule breaks I1 or I2 in the search (20) |
 |---|
 | the holder's lease expires; a lapsed lease does not enable; expiry is latched |
 | node ids are not reused; readback must match the session tag |
@@ -663,12 +717,14 @@ found" means no violation inside the bounds above, not that the rule is unnecess
 | overlap only from a confirmed holder; the previous lease expires; the EN_GATE one-shot honours the previous lease |
 | the challenge reservation is stored before a challenge is sent; a reset resumes above it; the challenge tag is bound to its value |
 | the new node id is stored before the rotation is sent |
+| a flush aborts downstream TX, resets the drive, and only then stores the cleared id set |
+| a failed storage write disables the gate until reset (found only with two fault classes per run: a failed write, then a reset, gives node-id reuse; `EXPLORE=deep`) |
 
 | Not found by the search (11) | Why |
 |---|---|
+| flush on any rejected token | availability: a forged token would reset the drive needlessly; FW3–FW11 catch it |
 | expired challenge not latched | needs 2^32 ticks; caught by W3 |
 | reset forgets used ids | needs three sessions and a reset, beyond the exhaustive bounds; caught by X3m |
-| gate keeps serving after a failed storage write | needs a failed write and then a reset; the search injects one fault class per run; caught by FW13, FW14 |
 | old lease alone keeps energy on | in this code the previous holder cannot renew, so its lease ends inside its own bound. `Fenced.old_lease_alone_breaks` shows the rule is needed where it can |
 | commands forwarded from any origin | unreachable through the firmware loop, which passes the holder; guards the core's API |
 | command sequence not advanced | a replayed command has the same author as the original |
@@ -679,8 +735,9 @@ found" means no violation inside the bounds above, not that the rule is unnecess
 | confirmation does not end the overlap | promptness |
 
 One mutant, "token redeemable twice", did not finish: every extra redemption opens a new session,
-the state space outgrew this machine's memory, and the run was killed three times. Random walks
-did not find a violation; T7 and FW5 catch it.
+and the state space outgrew this machine's memory three times. A fourth run on 2026-11-18, with
+sessions capped at tokens + 2, hit its 25-minute limit. Random walks did not find a violation;
+T7 and FW5 catch it.
 
 What this does **not** show: any timing, the EN_GATE wire, phase current or motion. "Energized
 torque" here means `input_torque_` while the gate's enable flag is high. P3a is "falsified if A's

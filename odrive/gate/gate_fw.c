@@ -26,6 +26,12 @@ enum { UP_CHAL_REQ = 0x010, UP_CHAL = 0x011, UP_TOKEN1 = 0x020, UP_TOKEN2 = 0x02
 #ifndef GATE_CHAL_CHUNK
 #define GATE_CHAL_CHUNK 1024u  // challenge values reserved per storage write (flash endurance)
 #endif
+#ifndef GATE_DRIVE_BOOT_ID
+#define GATE_DRIVE_BOOT_ID 0   // the node id the drive has after a reset (its stored configuration)
+#endif
+#ifndef GATE_RESERVED_IDS
+#define GATE_RESERVED_IDS 0ull // bit i set: node id i is never given to the drive (other nodes downstream)
+#endif
 #ifndef GATE_RB_MS
 #define GATE_RB_MS 5u     // readback poll period
 #endif
@@ -49,6 +55,18 @@ static bool persist(void) {
     return ok;
 }
 
+// Verified flush (C14): make every node id usable again. Order matters. The cleared id set is
+// stored only after the downstream mailboxes are empty and the drive has been reset: stored
+// first, a crash in between would leave a drive that still holds an old setpoint under an id the
+// gate believes is fresh. A crash after the reset but before the write just repeats the flush.
+static void flush(void) {
+    port_en_gate(0);
+    gate_drop(&g);
+    if (!port_down_abort() || !port_drive_reset()) { ok = false; return; }
+    gate_flush(&g, GATE_DRIVE_BOOT_ID, GATE_RESERVED_IDS);
+    persist();
+}
+
 void gate_fw_init(void) {
     gate_nv nv;
     port_en_gate(0);
@@ -61,7 +79,7 @@ void gate_fw_init(void) {
     g.session = nv.session;
     g.used = nv.used;
     g.chal = chal_top = nv.chal;
-    gate_boot(&g, nv.node, 0);
+    gate_boot(&g, nv.node, GATE_RESERVED_IDS);
     last_rb = port_now();
 }
 
@@ -70,6 +88,7 @@ void gate_fw_poll(void) {
     char line[32];
     uint32_t now = port_now(), c;
     uint8_t origin, flags, cf[8];
+    int r;
 
     while (ok && port_up_recv(&f)) {
         switch (f.id) {
@@ -98,9 +117,11 @@ void gate_fw_poll(void) {
             memset(t1, 0, sizeof t1);
             // Store the new node id before the rotation leaves: after a crash in between, the
             // gate cannot reach the drive and stays disabled until a verified flush.
-            if (gate_token(&g, port_key(), origin, flags, c, f.data, now, GATE_T_MS, &out) == GATE_ROTATE &&
-                persist())
-                port_down_send(&out);
+            r = gate_token(&g, port_key(), origin, flags, c, f.data, now, GATE_T_MS, &out);
+            if (r == GATE_ROTATE && persist()) port_down_send(&out);
+            // Out of node ids. Only an authentic token gets here, so nobody else can force a
+            // drive reset. This token is spent; the next one finds a flushed gate.
+            if (r == GATE_EXHAUSTED) flush();
             break;
         case UP_CMD:
             if (f.len == 8 && gate_command(&g, f.data, &out)) port_down_send(&out);
