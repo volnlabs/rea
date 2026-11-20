@@ -102,7 +102,8 @@ static inline void gate_tick(gate* g, uint32_t now) {
 // The gate's tag on a challenge it announces. The challenge is a counter, so its next value is
 // no secret: without this tag a controller could ask the authority for a token for a challenge
 // the gate has not issued yet, keep it past its own revocation, and redeem it when the counter
-// gets there. The authority must mint only for a challenge that carries this tag.
+// gets there. The authority must mint only for a challenge that carries this tag, and must stop
+// checking after a few failures (authority.py ChallengeGuard): 32 bits fall to unlimited guessing.
 static inline void gate_chal_mac(const uint8_t key[32], uint32_t chal, uint8_t out[4]) {
     uint8_t m[5] = {'G'}, h[32];
     memcpy(m + 1, &chal, 4);

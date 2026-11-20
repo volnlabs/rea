@@ -134,6 +134,7 @@ Evidence types:
 - **E** executed on real code (SIL)
 - **S** static source or datasheet reading
 - **M** finite model check
+- **K** proved on the C code by an inductive model check (CBMC; unbounded runs, MACs as free values)
 - **A** assumption
 - **O** open
 
@@ -166,7 +167,7 @@ Evidence types:
 | C26 | The gate core accepts a token only for the open challenge, inside W, once, with a valid tag; commands are accepted only under the holder's session key, each sequence number once; a spent failed-tag budget drops the holder | E | `odrive/sil` T1–T9, C1–C6 |
 | C27 | Make-before-break in the gate core: enable stays high across a handover only while both leases are live and the old holder was confirmed; confirmation ends the overlap | E | `odrive/sil` H1–H8 (code counterpart of C22, C23) |
 | C28 | A firmware loop over a board interface runs the whole sequence (challenge, token, rotation, authenticated command, UART readback, EN_GATE, expiry, reset, storage failure) on a host port against unmodified ODrive CAN code | E | `odrive/gate/gate_fw.c`; `odrive/sil` FW0–FW14 |
-| C29 | Every one of 32 mutants of the gate core and firmware loop fails at least one SIL check | E | `odrive/sil/mutate.py` |
+| C29 | Every one of 35 mutants of the gate core and firmware loop fails at least one SIL check | E | `odrive/sil/mutate.py` |
 | C30 | A deadline test on a wrapping 32-bit clock revives an ended lease 2^31 ticks later (found in our own gate core, reproduced, fixed); latching expiry is sound for any number of wraps if the gate looks at the clock at least once every 2^31 − T ticks | P, E | `ClockWrap.live_iff`, `zombie`, `latch_sound`, `no_latch_unsound`; `odrive/sil` W1–W4 |
 | C31 | Timed finality (I1) and attribution (I2) hold for the gate firmware's C code in every reachable state of a bounded adversarial environment: delayed, lost and reordered downstream frames, replayed and forged tokens and commands, stale readback, gate reset, crash after a storage write, failed write, drive reboot, firmware hang | M (on code) | `odrive/sil/explore.c`: exhaustive at small bounds, random walks at larger ones |
 | C32 | Which gate rules finality needs: removing one breaks I1 or I2 in the explored space; the rest are hardening, availability or promptness | M (on code) | `mutate.py` against `explore.c`; table in `PROOF.md` |
@@ -177,6 +178,10 @@ Evidence types:
 | C38 | A complete STM32F4 image of the gate (register-level board layer, no vendor library) links and passes a 14-step end-to-end sequence in Renode's STM32F4 model, including EN_GATE falling by the timer alone with the CPU halted | E (emulation only) | `odrive/gate/stm32/renode_test.sh` |
 | C39 | A gate clock counted by an interrupt stretches leases across a firmware stall (found in emulation in our own board layer, fixed with a free-running hardware counter) | E (emulation) | `port_stm32f4.c`; `PROOF.md` |
 | C40 | A key slot filled at provisioning but declared `const` lets the compiler delete the whole gate loop from the production image (found in our own board layer; build check and provisioning-style emulation now catch it) | E (build, emulation) | `odrive/gate/stm32/build.sh`, `renode_test.sh`; `PROOF.md` |
+| C41 | The firmware loop arms EN_GATE and forwards setpoints only under a live lease, and never past i + W + T (i: when the gate first sent the challenge behind the lease); a token is redeemed only for the challenge sent last, within W; for every T, W < 2^30, every run length, any number of frames per poll, resets, failed writes, and any clock step within the latch obligation | K | `odrive/sil/prove_fw.c` (P1–P3), `prove.sh` |
+| C42 | Reading the clock once per poll breaks the bound: a flood of upstream frames keeps one poll running, and EN_GATE is then armed from a stale time past the lease end (found by the proof in our own loop; fixed by a clock read per frame and right before arming) | K, E | `prove_fw.c`; SIL FW19, FW20; mutant "clock read once per poll" |
+| C43 | On the STM32F4 image the path from the clock read to arming the one-shot has no loop: about 105 instructions plus at most one 18-instruction UART interrupt, under about 25 µs at 16 MHz. The gate's own share of δ is that gap; the drive's share (EN_GATE to zero phase current) stays an assumption | S | disassembly of `gate.elf`; `PROOF.md` |
+| C44 | A 32-bit challenge tag with no failure budget at the authority lets a still-authorized controller guess a future challenge's tag (about 6 days expected at bus rate) and redeem it after revocation; the authority must lock out after a few failures (found by independent review) | S, A | `authority.py` `ChallengeGuard`; `PROOF.md` |
 | C34 | The gate firmware loop compiles for Cortex-M4 and Cortex-M0+ with no dependencies beyond the board interface, `memcpy`/`memmove`/`memset` and `strtof` (about 3 kB of code) | E (compile only) | `check.sh` |
 | C20 | Multikernel master applies a deferred PCI config write from a halted incarnation to a re-spawned incarnation's lease (instance-id reuse without generation); fixed by `d83cf0024f4f` in open PR multikernel/linux#41, reintroduced by upstream's lease rework | S | `finality/MULTIKERNEL.md`; branch selftests model it |
 

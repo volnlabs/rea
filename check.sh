@@ -2,7 +2,7 @@
 # Re-run every proof, model check and software test in this repo. Exits non-zero on any failure.
 # Needs: elan (Lean toolchain from ./lean-toolchain), python3, gcc, g++, git, network on first run.
 # Optional: clang with an ARM target and lld (Cortex-M compile check, STM32F4 image); Renode
-# (runs that image in emulation).
+# (runs that image in emulation); CBMC 6.x (proof of the firmware loop).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,8 +19,12 @@ echo "== odrive/gate/authority.py";          python3 -I odrive/gate/authority.py
 echo "== odrive/sil (tests, then exploration: about 7 minutes)"
 odrive/sil/run.sh | grep -E "^(ALL CHECKS|FAIL|explore: unchecked|EXPLORE|SIL)"
 echo "== odrive/sil/mutate.py";                python3 -I odrive/sil/mutate.py | tail -1
+# Inductive proof of the firmware loop (P1-P3 in odrive/sil/prove_fw.c): about 3 minutes.
+echo "== odrive/sil/prove.sh (CBMC)"
+if command -v cbmc >/dev/null; then odrive/sil/prove.sh | grep -E "^\*\* [0-9]|^VERIFICATION"
+else echo "skipped: cbmc not installed"; fi
 # Compile-only check that the gate firmware loop builds for Cortex-M with no host dependencies.
-# Skipped when clang has no ARM target. Nothing is linked or run: there is no STM32 port yet.
+# Skipped when clang has no ARM target.
 echo "== gate firmware, Cortex-M compile check"
 tmp=$(mktemp -d)
 if echo 'int x;' | clang --target=arm-none-eabi -mcpu=cortex-m4 -x c -c - -o "$tmp/probe.o" 2>/dev/null; then

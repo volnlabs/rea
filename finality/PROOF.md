@@ -416,9 +416,11 @@ Limits of the handover result:
 - **Exact-effect grant sets** (Actryn): grants are identities for one protected effect. With
   one gate per effect, the theorems apply per effect. Grant sets with alternate support
   across effects are not modelled.
-- **Refinement to gate firmware:** the firmware loop (`../odrive/gate/gate_fw.c`) exists and is
-  explored exhaustively at small bounds against the two finality properties (see "Bounded
-  exploration" below). There is still no proof that it refines `Fenced.Step`.
+- **Refinement to gate firmware:** the firmware loop (`../odrive/gate/gate_fw.c`) is explored
+  exhaustively at small bounds against the two finality properties (see "Bounded exploration"
+  below), and its gate-side timing (P1–P3) is proved on the C code for unbounded runs (see
+  "Inductive proof of the firmware loop"). There is still no proof that it refines `Fenced.Step`:
+  the drive side (rotation, readback) is only explored.
 - **Fairness-based liveness:** see above.
 
 **Rule necessity:** this file proves no counterexamples of its own. Each rule's necessity is
@@ -545,7 +547,7 @@ SIL binary runs them against the ODrive code:
 
 | W1–W4 | 32-bit clock wrap: an ended lease, challenge or previous lease never comes back; a lease spanning the wrap runs its exact length |
 
-`odrive/sil/mutate.py` applies 32 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
+`odrive/sil/mutate.py` applies 35 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
 
 Differences from `FencedFinality.lean`:
 - overlap is opt-in per token (the model always overlaps from a confirmed holder);
@@ -704,7 +706,7 @@ or the drive. Renode's peripheral models are the reference here, not the referen
 image has never been flashed.
 
 **Which rules finality needs (mutants against the exhaustive search).** Each of
-the 32 mutants was run against the full exploration (exhaustive, then random walks), with the
+the first 32 mutants was run against the full exploration (exhaustive, then random walks), with the
 unit tests ignored. This sorts the rules by what they are for. It is bounded evidence: "not
 found" means no violation inside the bounds above, not that the rule is unnecessary.
 
@@ -737,9 +739,100 @@ found" means no violation inside the bounds above, not that the rule is unnecess
 One mutant, "token redeemable twice", did not finish: every extra redemption opens a new session,
 and the state space outgrew this machine's memory three times. A fourth run on 2026-11-18, with
 sessions capped at tokens + 2, hit its 25-minute limit. Random walks did not find a violation;
-T7 and FW5 catch it.
+T7 and FW5 catch it. **Resolved 2026-11-19: it is not a finality rule.** Every redemption of a
+token falls within W of its challenge's issue, which precedes the mint, so a second redemption
+gives a lease that ends inside the same bound. The CBMC proof below holds with the mutant in
+place. The rule limits churn: each extra redemption for another origin burns a node id
+(availability).
 
 What this does **not** show: any timing, the EN_GATE wire, phase current or motion. "Energized
 torque" here means `input_torque_` while the gate's enable flag is high. P3a is "falsified if A's
 value never appears" only on hardware; in SIL the baseline arm shows that the firmware's dispatch
 accepts A's frame, which the F-series already established.
+
+### Inductive proof of the firmware loop (`../odrive/sil/prove_fw.c`, CBMC 6.11), run 2026-11-19
+
+The firmware loop `gate_fw.c` and the core `gate.h`, unmodified, are checked with CBMC against
+a board model (`prove.sh`, about 2 minutes). The harness starts from **any** state that satisfies
+an invariant, takes one step (a reset with arbitrary RAM, or one poll), and asserts the invariant
+again. Induction then covers runs of any length. Lease length T and window W are symbolic in
+(0, 2^30). The clock may jump by up to 2^31 - max(T, W) between reads, which is the latch
+obligation of `gate.h`. Real time advances separately from the firmware's clock reads, so
+staleness is visible. Storage writes may fail, and a failed write may still have landed.
+Checked properties:
+
+- **P1.** EN_GATE is armed only for a live lease, and only until before i + W + T. Here i is
+  when the gate first sent the challenge behind that lease. During an unconfirmed handover the
+  same holds for the previous holder's lease.
+- **P2.** A setpoint goes downstream only under a live lease, before i + W + T.
+- **P3.** A token is redeemed only for the challenge the gate sent last (the value in the
+  token's tagged message), within W of its first sending. A challenge value is never announced
+  again unless it is still open.
+
+Add the authority's obligation: it mints only for a challenge carrying the gate's tag, so after
+the gate sent it, and never after revocation at t_c. Then i ≤ t_c, and the gate's support for the
+output ends by t_c + W + T. MACs are free values (any tag may verify), so this part assumes
+nothing about the cryptography. CBMC's bounds, pointer and shift checks run on the same code.
+
+A poll with k frames is covered by one-frame polls: the loop reads the clock and latches expiry
+before each frame. The extra latch and EN_GATE check at the end of each one-frame poll only latch
+what the next read would latch anyway, and add checks.
+
+**Found by the proof in our own code (all fixed, each with a SIL test and a mutant):**
+
+| Finding | Effect | Fix | SIL |
+|---|---|---|---|
+| The clock was read once per poll | A flood of upstream frames keeps one poll running; EN_GATE is then armed from the stale reading, past the lease end. **Breaks the bound** | Read the clock per frame and right before arming; the UART query moved after arming | FW19 |
+| `gate_command` has no clock and no latch ran before it | A command that arrives after the lease ran out, before the next latch, is forwarded (EN_GATE is already low, so this is P2, not output) | Latch expiry before each frame | FW20 |
+| The node id loaded from storage was not range-checked | `1ull << node` is undefined for node ≥ 64 | Fail closed on node ≥ 64 | FW21 (UBSan) |
+
+The first version of the harness missed the first finding, because it advanced time only when the
+firmware read the clock. The mutant "clock read once per poll" survived it. The harness was fixed
+so that real time also advances while a frame is handled.
+
+**Mutants against the proof alone** (`PROVE=1 mutate.py`): 18 of 35 killed. The proof kills every
+timing rule, and also "token for any challenge" and the storage rules for challenges. As expected,
+it does not kill:
+- drive-side rules (readback, node ids, flush order, rotation storage);
+- MAC rules (tags are free values);
+- "token redeemable twice" (not a finality rule, see above);
+- "overlap from an unconfirmed holder" and "confirmation does not end the overlap". These are
+  about which setpoint the drive holds; the explorer and the SIL tests cover them.
+
+**The gate's share of δ (static, STM32F4 image).** In `gate.elf` the path from the clock read
+(`port_now`) to the TIM2 start in `port_en_gate` has no backward branch other than into the call
+itself. That is about 105 instructions. The only enabled interrupt is USART1 (18 instructions);
+at 115200 baud it fires at most once per 87 µs. At 16 MHz that is under about 400 cycles, or
+roughly 25 µs. TIM2 (EN_GATE) and TIM5 (clock) count whole milliseconds. The one-shot is armed
+for the time left measured from a TIM5 reading taken before the arm, so tick rounding ends the
+pulse early, not late. EN_GATE therefore falls at most that gap after the lease end. This is a
+static reading, with the timer hardware taken as correct; it has not been measured. The drive's
+share (EN_GATE low to zero phase current) remains assumption C13.
+
+### Independent review of the message authentication (2026-11-19)
+
+A reviewer given only the code and a threat model reported:
+
+- **Critical, fixed.** Nothing limited failed challenge-tag checks at the authority. A controller
+  that is still authorized can guess the 32-bit tag of a future counter value (about 2.9·10^7
+  tries per hour at bus rate, about 6 days expected). It then holds a token it can redeem after
+  its own revocation, which breaks the bound. Fix: `authority.ChallengeGuard` refuses every
+  challenge after 16 failed tags until an operator resets it. A guess then succeeds with
+  probability at most 16/2^32 per alarm. Anyone on the upstream bus can trigger the lockout,
+  which costs availability, not safety.
+- **High, open (cryptographic margin).** The 32-bit command tag is checked against 8 sequence
+  numbers, which gives 2^-29 per frame and about 2^-25 per session (failure budget 16). An
+  attacker who forces re-grants (16 bad frames drop the holder; the next grant rotates and resets
+  the budget) gets about R·3600·2^-25 per hour at R grants/s. A success injects one setpoint
+  under a live lease: an integrity break, still inside the time bound. The real fix is longer
+  tags (CAN FD) or a per-origin budget that survives rotation.
+- **High, assumption.** How the session key reaches the controller is not specified. It must
+  travel on a confidential channel between authority and controller, never on the gate's bus.
+- **Medium, open.** Renewal keeps the first session key, while a re-grant after a drop rotates
+  it. The authority cannot tell which happened, so the controller can fall out of sync
+  (availability). Held-back commands can be released later while the lease is live (stale but
+  authentic setpoints). The 32-bit sequence number would wrap after about 2^32 commands without
+  re-keying.
+- **Low.** No gate id in the MACs: one key per gate is required. Flash wear from unauthenticated
+  challenge requests is about 70 records an hour; with 4096 records per sector and two sectors
+  alternating, that is decades.

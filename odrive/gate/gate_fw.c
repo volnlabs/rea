@@ -1,6 +1,6 @@
 // Gate firmware loop: glue between the board (gate_port.h) and the gate core (gate.h).
-// Run in SIL against unmodified ODrive CAN code (../sil/test_fence.cpp, section FW). Never run
-// on an MCU: the STM32 port does not exist yet, and nothing here is timing-verified.
+// Run in SIL against unmodified ODrive CAN code (../sil/test_fence.cpp, section FW), proved with
+// CBMC (../sil/prove_fw.c), and run in emulation on the STM32F4 port (stm32/). Never on silicon.
 // EN_GATE is re-armed on every poll for the time left on the lease (port_en_gate), so a hung
 // loop cannot hold it high past the lease.
 //
@@ -74,7 +74,7 @@ void gate_fw_init(void) {
     gate_drop(&g);
     have_t1 = false;
     memset(t1, 0, sizeof t1);
-    ok = port_nv_load(&nv);
+    ok = port_nv_load(&nv) && nv.node < 64;  // ODrive node ids are 6 bits
     if (!ok) return;
     g.session = nv.session;
     g.used = nv.used;
@@ -86,11 +86,15 @@ void gate_fw_init(void) {
 void gate_fw_poll(void) {
     gate_frame f, out;
     char line[32];
-    uint32_t now = port_now(), c;
+    uint32_t now, c;
     uint8_t origin, flags, cf[8];
     int r;
 
     while (ok && port_up_recv(&f)) {
+        // The clock is read per frame: a flood of frames can keep this loop running for long.
+        // Expiry is latched first because gate_command has no clock of its own.
+        now = port_now();
+        gate_tick(&g, now);
         switch (f.id) {
         case UP_CHAL_REQ:
             c = gate_challenge(&g, now, GATE_W_MS);
@@ -129,9 +133,11 @@ void gate_fw_poll(void) {
         }
     }
     if (port_uart_line(line, sizeof line)) gate_readback(&g, line);
+    // The one-shot runs for the time left from this read; nothing slow sits between them.
+    now = port_now();
+    port_en_gate(ok ? gate_enable_for(&g, now) : 0);
     if (now - last_rb >= GATE_RB_MS) {
         port_uart_write("r axis0.controller.input_vel\n");
         last_rb = now;
     }
-    port_en_gate(ok ? gate_enable_for(&g, now) : 0);
 }

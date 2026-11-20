@@ -10,7 +10,7 @@ output?
 | `odrive/` | ODrive v3 (fw 0.5.x) command lifecycle, STM32/DRV8301 gate analysis, bench script (`bench/`, needs hardware), the gate's portable C core and firmware loop (`gate/`), and software-in-the-loop tests and bounded exploration of both against unmodified ODrive CAN code (`sil/`) |
 | `finality/` | Lean 4 proofs and Python models: composed timed finality, gate refinement, impossibility without a downstream bound or fence, finite node-id fence. Start with `finality/PROOF.md` |
 
-Run everything: `./check.sh` (Lean 4.35.0 via elan, python3, gcc, g++; about 10 minutes and 2 GB of memory, most of it the
+Run everything: `./check.sh` (Lean 4.35.0 via elan, python3, gcc, g++; about 25 minutes and 2 GB of memory, most of it the
 exhaustive exploration of the gate firmware loop in `odrive/sil/explore.c`).
 
 `ARCHITECTURE_REVIEW.md` reviews the AxiomOS brief against this evidence.

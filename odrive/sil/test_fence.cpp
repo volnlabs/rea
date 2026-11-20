@@ -432,12 +432,14 @@ static uint32_t p_en_until;   // the one-shot's deadline, for the stalled-firmwa
 static gate_nv p_nv;
 static uint32_t p_nv_writes, p_flushes;
 static bool p_abort_ok = true;
+static uint32_t p_frame_ms;   // clock advance while the gate handles one upstream frame (flood)
 extern "C" {
 uint32_t port_now(void) { return p_now; }
 bool port_up_recv(gate_frame* f) {
     if (p_up.empty()) return false;
     *f = p_up.front();
     p_up.pop_front();
+    p_now += p_frame_ms;
     return true;
 }
 void port_up_send(const gate_frame* f) { p_up_tx.push_back(*f); }
@@ -604,6 +606,33 @@ static void firmware() {
     check(p_flushes == flushes && p_nv.used == ~0ull && !p_en && !fw_chal(&c),
           "FW18 TX abort not confirmed: no drive reset, stored id set still full, gate disabled");
     p_abort_ok = true;
+
+    // A flood of upstream frames keeps one poll running past the lease end.
+    p_nv.used = 1ull << 40;   // fresh ids (test only: no flush in between)
+    gate_fw_init();
+    fw_run(W_MS);
+    fw_chal(&c);
+    fw_token(A, 0, c);
+    Ctl fl(A, c);
+    p_up.push_back(fl.cmd(0.5f));
+    fw_run(12);
+    bool was_on = p_en;
+    uint32_t end = g->expiry;
+    for (int i = 0; i < 100; ++i) p_up.push_back(gate_raw(0x07F, "", 0));
+    p_frame_ms = 3;
+    gate_fw_poll();
+    check(was_on && (!p_en || p_en_until <= end), "FW19 300 ms of frames inside one poll: EN_GATE is not armed past the lease end");
+    fw_chal(&c);
+    fw_token(A, 0, c);
+    for (int i = 0; i < 70; ++i) p_up.push_back(gate_raw(0x07F, "", 0));
+    p_up.push_back(fl.cmd(0.6f));
+    gate_fw_poll();
+    p_frame_ms = 0;
+    fw_run(12);
+    check(tq == 0.5f, "FW20 a command handled after the lease ran out, inside the same poll, is not forwarded");
+    p_nv.node = 64;
+    gate_fw_init();
+    check(!fw_chal(&c) && !p_en, "FW21 stored node id out of range (6 bits): gate stays disabled");
 }
 
 int main() {

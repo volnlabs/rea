@@ -21,11 +21,35 @@ def verify_challenge(key: bytes, data: bytes):
     """Authority service: the challenge in a CHAL frame, or None if the gate did not issue it.
 
     Never mint for a challenge that fails this: the challenge is a counter, and a token for a
-    future value would outlive the revocation of whoever asked for it.
+    future value would outlive the revocation of whoever asked for it. Call it through
+    ChallengeGuard: the tag is short enough to guess without a failure budget.
     """
     if len(data) != 8 or not hmac.compare_digest(_mac(key, b"G" + data[:4])[:4], data[4:]):
         return None
     return struct.unpack("<I", data[:4])[0]
+
+
+class ChallengeGuard:
+    """Authority service: verify_challenge with a failure budget. Mint only through this.
+
+    The challenge tag is 32 bits. With unlimited tries a controller that is still authorized can
+    guess the tag of a future counter value, get a token for it, and redeem it after its own
+    revocation, when the gate reaches that value: no time bound left. After MAX_BAD failed tags
+    the authority refuses every challenge until an operator resets it (an alarm, not a retry), so a
+    guess succeeds with probability at most MAX_BAD / 2^32 per alarm. Anyone on the upstream bus can
+    trigger that lockout: availability, not safety.
+    """
+    MAX_BAD = 16
+
+    def __init__(self, key: bytes):
+        self.key, self.bad = key, 0
+
+    def verify(self, data: bytes):
+        if self.bad >= self.MAX_BAD:
+            return None
+        c = verify_challenge(self.key, data)
+        self.bad += c is None
+        return c
 
 
 def token_frames(key: bytes, origin: int, flags: int, chal: int):
@@ -69,6 +93,11 @@ if __name__ == "__main__":
     chal = struct.pack("<I", 0x01020304) + _mac(VECTOR_KEY, b"G" + struct.pack("<I", 0x01020304))[:4]
     assert verify_challenge(VECTOR_KEY, chal) == 0x01020304
     assert verify_challenge(VECTOR_KEY, struct.pack("<I", 0x01020305) + chal[4:]) is None
+    guard = ChallengeGuard(VECTOR_KEY)
+    assert guard.verify(chal) == 0x01020304
+    for _ in range(ChallengeGuard.MAX_BAD):
+        assert guard.verify(chal[:4] + b"\0\0\0\0") is None
+    assert guard.verify(chal) is None, "locked out after MAX_BAD failed tags"
     got = {"token": (t1 + t2).hex(), "session": ks.hex(), "cmd": cmd.hex(), "chal": chal.hex()}
     assert got == VECTORS, got
     print("authority.py: vectors match")
