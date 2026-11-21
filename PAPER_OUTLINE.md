@@ -3,7 +3,13 @@
 Status: outline and evidence map, not prose. Every claim below points to an artifact in this
 repo. Nothing has been run on motor hardware.
 
-## Option being explored (2026-11-18, not decided)
+## Decision (2026-11-21): stage A first
+
+Stage A is written as `paper/main.tex` (AAAI-27 author kit) for the AAAI-27 AI4Factory workshop
+(due 2026-11-25, up to 8 pages, single-blind, OpenReview). Software evidence only. Hardware work
+(A+, C) continues on the `hardware` branch and feeds a later full paper.
+
+## Options considered (2026-11-18)
 
 Whether the paper can stand without a drive. Three possible stages, each a complete paper on
 its own:

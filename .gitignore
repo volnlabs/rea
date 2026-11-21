@@ -7,3 +7,10 @@ odrive/sil/.odrive-src/
 
 .venv/
 __pycache__/
+
+# LaTeX build output
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out

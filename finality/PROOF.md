@@ -648,7 +648,8 @@ What this is and is not:
   if addressed to its current node id, which the F-series checks on real ODrive code;
 - it is bounded. It says nothing about longer runs, more controllers, or three frames in flight;
 - it does not cover the 2^31-tick wrap (too far for any bounded run; W1–W4 and `ClockWrap.lean`
-  do), a second node on the downstream bus, or a verified flush (the loop has no flush path);
+  do) or a second node on the downstream bus. Verified flushes are explored in the flush
+  configuration below;
 - states are compared by 128-bit fingerprint; a collision would hide states.
 
 **Verified flush in the firmware loop (added 2026-11-13).** After 62 holder changes the node ids
@@ -672,7 +673,7 @@ id with no setpoint, no stale UART answer). A flush that only claims this is
 **STM32F4 image, built and run in emulation (added 2026-11-13).** `../odrive/gate/stm32/` holds a
 register-level board layer for an STM32F4 (written for NUCLEO-F446RE), start-up code and a linker
 script. `build.sh` links a complete image with clang and lld, no vendor library and no libc
-(about 5.8 kB of code, 284 bytes of RAM). `renode_test.sh` runs that image in Renode's STM32F4
+(about 5.9 kB of code, 284 bytes of RAM). `renode_test.sh` runs that image in Renode's STM32F4
 model and drives one whole sequence over the emulated CAN controllers, UART, flash and timers,
 starting from the production image with the key written into flash as provisioning would:
 

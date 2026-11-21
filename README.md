@@ -17,6 +17,9 @@ exhaustive exploration of the gate firmware loop in `odrive/sil/explore.c`).
 
 `PAPER_OUTLINE.md` maps every claim to its evidence: proved, executed, static, assumed or open.
 
+`paper/` is the software-only paper (AAAI-27 format). Build: `cd paper && pdflatex main && bibtex main && pdflatex main && pdflatex main`.
+Hardware work lives on the `hardware` branch.
+
 `rp1-fw/out/` is not committed. Regenerate it with:
 
 ```sh
