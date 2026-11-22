@@ -44,14 +44,15 @@ an energy interlock held by the \emph{new} authority will happily power the \emp
 command. We call this a setpoint hijack. We give a protocol, enforced by a small trusted gate in
 front of an unmodified drive, and a machine-checked bound: from $t_c + W + T + \delta$ on, where
 $t_c$ is the revocation, $W$ a challenge window, $T$ a lease and $\delta$ the output's shutdown
-delay, an energized output depends on the revoked controller neither for energy, nor for its
-committed setpoint, nor through any pending command. The bound holds with unbounded bus delay,
-a finite id space, gate resets, and a gate that never hears of the revocation, and scales with
-the gate's clock rate under drift. We
-connect it to the gate's C firmware with an inductive proof (CBMC), exhaustive exploration of 72
-million states, and software-in-the-loop tests against the unmodified CAN code of a commercial
-open-source drive (ODrive). These checks and an independent review found nine bugs in our own
-artifacts, each where a layer above abstracts. All evidence is software; $\delta$ and the motor are left to hardware work.
+delay, an energized output takes from the revoked controller neither its energy, nor its
+committed setpoint, and every pending frame of that controller is fenced off from the drive. The
+bound holds in a Lean model with unbounded bus delay, a finite id space, gate resets, and a gate
+that never hears of the revocation, and scales with the gate's clock rate under drift. On the
+gate's C firmware we prove the timing rules for unbounded runs with CBMC, and check the full
+property, including the drive side, by small-scope exhaustive exploration and by
+software-in-the-loop tests against the unmodified CAN code of an open-source drive (ODrive).
+These checks and an independent review found nine bugs in our own artifacts, most where a layer
+above abstracts. All evidence is software; $\delta$ and the motor are left to hardware work.
 \end{abstract}
 
 \section{Introduction}
@@ -74,8 +75,9 @@ keeps acting until something overwrites or de-energizes it. The obvious remedy i
 interlock, like Safe Torque Off \citep{iec61800}, driven by a lease: energy only while the current
 authority holds a live lease. That remedy has a hole. If the old controller's frame arrives after
 the new controller's lease has enabled energy, the drive runs the old controller's command, under
-the new controller's power. We call this a \emph{setpoint hijack}, and show it reachable, in proof and on
-the drive's real code, when the gate controls energy alone (Section~\ref{sec:hijack}).
+the new controller's power. We call this a \emph{setpoint hijack}, and show it reachable in proof
+when the gate controls energy alone, and show on the drive's real code that the late command is
+installed (Section~\ref{sec:hijack}).
 
 The question this paper answers is: \emph{after an AI controller is revoked at time $t_c$, by when
 is the physical output provably free of it, if the drive is stock and untrusted?} Our answer is a
@@ -91,15 +93,17 @@ hidden commits and unbounded delay, no gate policy that only observes can be bot
 across a controller change once a frame may have been lost, so some fence on the drive's side is
 necessary.
 \item \textbf{A protocol and a composed timed theorem} in Lean~4 \citep{demoura2021lean4}: after
-$t_c + W + T + \delta$, an energized output depends on the revoked controller in no way, under
-unbounded delay, finite ids and gate resets, with a gate that is never told of the revocation, and
-with a deadline scaled by the clock rate under drift. Each protocol rule has a mechanised
+$t_c + W + T + \delta$, an energized output takes neither energy nor its committed setpoint from
+the revoked controller, and the controller's pending frames are fenced, under unbounded delay,
+finite ids and gate resets, with a gate that is never told of the revocation, and with a deadline
+scaled by the clock rate under drift. Each rule in Table~\ref{tab:rules} has a mechanised
 counterexample when dropped, in the full model or one of its components.
 \item \textbf{A retrofit for a stock drive.} The ODrive v3 firmware's CAN node-id check becomes
 the fence, and a free field of its setpoint frame becomes a session tag for readback. Both are
 checked in software-in-the-loop (SIL) on the drive's unmodified CAN code.
-\item \textbf{Evidence that reaches the firmware.} The gate's C code is proved with an inductive
-CBMC harness \citep{clarke2004cbmc}, explored exhaustively against the finality property, tested
+\item \textbf{Evidence that reaches the firmware.} The gate's timing rules are proved on its C code
+with an inductive CBMC harness \citep{clarke2004cbmc}; the code is also explored exhaustively,
+at small bounds, against the full finality property, tested
 in SIL, mutation-checked, and run as an STM32F4 image in emulation. We report the nine bugs these
 checks and review found in our own artifacts, and what found each.
 \end{itemize}
@@ -132,8 +136,9 @@ assumption, and we say where it enters.
 \draw[->, thick] (gate.east) -| node[lab, pos=0.75, right] {EN\_GATE\\one-shot} (out.north);
 \end{tikzpicture}
 \caption{System. Controllers, including revoked ones, keep upstream access. The gate is the only
-path to the drive's command bus, UART and energy enable. The drive and both buses are untrusted
-and may delay, drop or reorder frames.}
+path to the drive's command bus, UART and energy enable (EN\_GATE, driven by a hardware one-shot
+timer, Section~\ref{sec:protocol}). The drive and both buses are untrusted and may delay, drop or
+reorder frames.}
 \label{fig:system}
 \end{figure}
 
@@ -141,7 +146,9 @@ Figure~\ref{fig:system} shows the parties. An \emph{authority service} decides w
 may act; it grants by minting tokens and revokes by refusing to mint. \emph{Controllers} are AI
 agents or humans. A revoked controller is not trusted to stop: it keeps full access to the
 upstream bus, and may replay or withhold anything it ever received. The \emph{gate} is a small
-microcontroller and is the only trusted component on the control path. Behind it, the
+microcontroller and is the only trusted component on the control path. The trusted base is the
+gate, the authority service, the key they share, and the power stage's enable input; a
+compromised authority or key voids the bound. Behind the gate, the
 \emph{downstream bus} and the \emph{drive} are untrusted in timing: frames may be delayed without
 bound, dropped, reordered, or stuck in a mailbox forever, and the gate never learns when the drive
 commits a frame. The drive holds the last setpoint it accepted. The \emph{power stage} energizes
@@ -150,6 +157,7 @@ falls.
 
 Two parameters are the gate's to choose: the lease length $T$ and the challenge window $W$. The
 gate never needs to be told of a revocation; it may be partitioned from the authority forever.
+Time is discrete, in gate clock ticks, and $W$, $T$ and $\delta$ are measured in ticks.
 
 \begin{definition}[Timed finality]
 Let controller $r$ be revoked at $t_c$. The system has \emph{timed finality with deadline $D$} if
@@ -160,7 +168,9 @@ no pending downstream frame authored by $r$ can still be committed by the drive.
 
 Condition (iii) is what makes the property hard. A frame stuck in a bus controller is invisible to
 the gate and may surface at any time. Leases bound (i), and readback can confirm (ii), but neither
-says anything about (iii).
+says anything about (iii). The definition concerns the controller's commands, not the physical
+state they caused: momentum or position reached before $t_c+D$ remain, and are the safety
+controller's to handle.
 
 \section{Why an Energy Gate Is Not Enough}
 \label{sec:hijack}
@@ -173,13 +183,14 @@ installs $\tau_A$. The output is energized under $B$'s valid lease and executes 
 No delay is even needed: if $B$'s first frame is lost, the drive still holds $\tau_A$ when $B$'s
 lease enables energy. In our Lean product model, a path around the gate (\code{command\_bypass}) or a
 gate that forwards any origin (\code{no\_filter}) reaches a state past the deadline with
-energized output and the revoked grant's setpoint; the refined model with an explicit downstream stage
-gives the delayed-frame and lost-frame versions (\code{reordered\_commit}, \code{lost\_command}).
-On the unmodified ODrive CAN code in SIL,
-a power-only gate shows the hijack both from $A$'s persistent setpoint and from $A$'s late frame.
-The same configuration arises on industrial drives whenever a safety fieldbus such as
-PROFIsafe \citep{iec61784} fences the safe-torque-off channel while motion setpoints travel as
-ordinary process data.
+energized output and the revoked grant's setpoint; in the refined model with an explicit
+downstream stage, a gate without confirmed readback or without a check of frames in flight
+enables one grant while the drive holds, or may still commit, another grant's command
+(\code{reordered\_commit}, \code{lost\_command}). On the unmodified ODrive CAN code in SIL, the
+drive installs both $A$'s persistent setpoint and $A$'s late frame, which an enable that follows
+$B$'s lease would energize. The same configuration can arise on industrial drives if a safety
+fieldbus such as PROFIsafe \citep{iec61784} fences the safe-torque-off channel while motion
+setpoints travel as ordinary process data.
 
 \paragraph{No observation suffices.} Could the gate simply wait until the old frames are gone?
 We model the gate's enable decision as an \emph{arbitrary} function of its whole observation
@@ -203,7 +214,8 @@ gate turns this into an epoch fence.
 
 \paragraph{Tokens and leases.} A controller asks the gate for a challenge. The gate sends a
 counter value with a 32-bit tag under a key it shares with the authority, so the authority can tell
-the gate issued it. The authority mints a token, a MAC over (controller, flags, challenge), only for
+the gate issued it. The authority mints a token, a message authentication code (MAC) over
+(controller, flags, challenge), only for
 a controller it currently authorizes and only for a tagged challenge. The gate redeems a token only
 for its open challenge and only within $W$ of first sending it; redemption grants a lease of
 length $T$. Challenge and session counters survive resets. The session counter is stored as is;
@@ -215,6 +227,10 @@ since the last flush. The gate rotates the drive to it and addresses only the ho
 to it. A stale frame of the previous holder carries an old id and is dropped by the drive, however
 late it arrives. With $K$ ids, at most $K-1$ handovers fit between flushes. A \emph{verified
 flush} aborts the gate's transmit mailboxes and resets the drive, and only then frees the ids.
+Downstream the gate sends only two commands, the node-id change and the setpoint, so no
+controller can reach the drive's configuration. The simplest alternative, a verified flush at
+every handover, also meets the bound, but reboots the drive with energy off on each change; the
+id pool amortizes it to one flush per $K-1$ handovers.
 
 \paragraph{Session-tagged readback.} Before enabling energy the gate reads back, over a UART link
 it owns, that the drive holds the holder's setpoint. Value readback is not enough: a value-equal
@@ -222,7 +238,8 @@ stale frame would pass. ODrive prints floats with at most six decimals into a te
 buffer, so a tag in the low mantissa bits is invisible. Instead the gate runs the drive in torque
 mode with passthrough input and sends every setpoint as \code{SET\_INPUT\_VEL} with the velocity
 field set to a session tag (node id $+\,1$) and the torque field set to the value. In this mode
-the velocity input is unused by the controller, so the tag is free; the gate checks tag and value.
+the velocity input is unused by the controller, so the tag is free. The gate checks the tag; the
+value travels in the same frame (but see Section~\ref{sec:limits}).
 
 \paragraph{Energy.} EN\_GATE is not a pin level but a hardware one-shot timer, re-armed on every
 loop for the time left on the lease. A hung firmware loop cannot keep the output energized past
@@ -269,7 +286,7 @@ energy-path exclusivity & output on with no lease \\
 command filter / exclusivity & setpoint hijack \\
 fresh node ids & reused id revives a stuck frame \\
 verified flush & unverified flush, same \\
-node-id readback (not value only) & value-equal frame hides a lost rotation \\
+session-tag readback (not value only) & value-equal frame hides a lost rotation \\
 counters survive reset & old token replayed, or old session tag passes \\
 both leases in handover & old holder's energy runs new frame \\
 expiry latch (32-bit clock) & ended lease live again after $2^{31}$ ticks \\
@@ -295,14 +312,17 @@ Time advances unconditionally. Notification of the revocation to the gate is a s
 never happen.
 
 \begin{theorem}[\code{Fenced.finality}]
-For every reachable state $s$ with $\delta \ge 1$: if grant $r$ was revoked at $t_c$,
+For every reachable state $s$ with $\delta \ge 1$: if grant $r$ (one controller's authorization;
+one revoked grant per run) was revoked at $t_c$,
 $s.\mathit{now} \ge t_c + W + T + \delta$ and the output is energized, then the holder's and
 the previous holder's supporting leases are not $r$'s, the drive's committed setpoint was not
 authored by $r$, and every pending frame authored by $r$ is addressed to an id other than the
 drive's current one.
 \end{theorem}
 
-The proof is an inductive invariant over all steps. The $W$ term is the price of a gate that is
+The last conjunct is a state property; condition (iii) of the definition follows because ids are
+reused only after a verified flush. The proof is an inductive invariant over all steps. The $W$
+term is the price of a gate that is
 never told: a token minted just before $t_c$ can still be redeemed up to $W$ later. Further
 results in the same model:
 
@@ -322,7 +342,8 @@ stuck forever, a new grant still energizes the output after the deadline.
 \paragraph{Clock wrap.} The models use unbounded time; firmware uses a 32-bit tick counter. Our
 first gate core tested expiry as \code{(int32\_t)(expiry - now) > 0}, which is right only within
 $2^{31}$ ticks of the deadline: an ended lease tests live again 24.8 days later at 1\,ms per tick.
-This is the class of bug TCP's PAWS guards against \citep{rfc7323}, and the unbounded model cannot
+This is the class of bug TCP's protection against wrapped sequence numbers (PAWS) guards
+against \citep{rfc7323}, and the unbounded model cannot
 express it. \code{ClockWrap} proves the hazard (\code{zombie}) and the fix: latching expiry the
 first time it is seen is sound for any number of wraps if the gate reads its clock at least once
 every $2^{31} - T$ ticks (\code{latch\_sound}).
@@ -340,17 +361,19 @@ property in four ways.
 \paragraph{SIL on unmodified drive code.} We compile ODrive's unmodified \code{can\_simple.cpp}
 \citep{odrive} with address and undefined-behaviour sanitizers against stubs for the members it
 touches, emulate the CAN filter in software, and link the gate firmware against it. About 95
-checks cover the fence (all 32 command ids, data and remote frames, to a stale id change no drive
-state, including inside the window before the receive filter is renewed), the paired-tag readback
+checks cover the fence (frames to a stale id, for all 32 command ids, data and remote, change
+no drive state, including inside the window before the receive filter is renewed), the paired-tag readback
 (all 64 tags round-trip through the drive's own float printer), the hijack scenario with a
 power-only gate and with ours, token, command and handover rules, and the firmware loop end to end.
 
 \paragraph{Exhaustive exploration.} \code{explore.c} compiles the real \code{gate\_fw.c} into a
 search over an adversarial environment: it chooses time, mints tokens for any origin, lets a
-controller show the authority a not-yet-issued challenge, replays any token or command, presents
+controller show the authority a not-yet-issued challenge, replays any token or a controller's
+last command, presents
 tokens with made-up tags (and, in the random walks, forged commands), delays, drops and reorders downstream frames, returns stale or missing readback, and
 injects one fault per run (gate reset, crash after a storage write, failed write, drive reboot,
-firmware hang). After every step it checks I1 (EN\_GATE high and setpoint authored by $o$
+firmware hang). After every step it checks, for every origin (controller) $o$, I1 (EN\_GATE high
+and setpoint authored by $o$
 $\Rightarrow$ now $<$ last mint for $o$ $+\,W + T$) and I2 (the author is the holder or, during a
 handover, the previous holder). Authorship is a ghost label the gate never sees. At $W{=}1$,
 $T{=}3$, five ticks, two origins and two frames in flight, I1 and I2 hold in all 72{,}065{,}308
@@ -378,14 +401,16 @@ All 767 generated properties hold, including CBMC's bounds, pointer, division an
 
 \paragraph{Mutation analysis and emulation.} 35 hand-written mutants each weaken one rule of the
 gate; every one fails at least one check \citep{jia2011mutation}. Run against the exploration
-alone, 20 of the first 32 break I1 or I2. Of the other twelve, most are availability, hardening or
+alone, 20 of the first 32 break I1 or I2 (the last three were added with the proof and checked
+by it and the tests). Of the other twelve, most are availability, hardening or
 promptness rules; two need runs longer than the bounds and are caught by unit tests; and one,
 redeeming a token twice, we show is not needed for the bound, since every redemption falls within
 $W$ of the challenge. The proof alone kills 18 of the 35, every timing rule among them; it is
 blind by design to drive-side and MAC rules. A register-level STM32F4 board
 layer, with no vendor library, links into a 5.9\,kB image that passes a 14-step sequence in
 Renode's STM32F4 model \citep{renode}, including EN\_GATE falling by the timer alone with the CPU
-halted. Statically, the path from the clock read to arming the one-shot has no loop: about 105
+halted. By manual static reading of the image, the path from the clock read to arming the
+one-shot has no loop: about 105
 instructions plus at most one 18-instruction UART interrupt, under about 25\,$\mu$s at 16\,MHz,
 which is the gate's share of $\delta$.
 
@@ -396,25 +421,26 @@ which is the gate's share of $\delta$.
 \toprule
 Defect (all fixed) & Found by \\
 \midrule
-wrapped deadline test revives an ended lease & review; model cannot express \\
-bare-counter challenge: token for a future value outlives revocation & review; exploration gives a 19-step trace \\
-interrupt-counted clock stops while CPU halted, lease stretched & emulation \\
+$^*$wrapped deadline test revives an ended lease & review; model cannot express \\
+$^*$bare-counter challenge: token for a future value outlives revocation & review; exploration gives a 19-step trace \\
+$^*$interrupt-counted clock stops while CPU halted, lease stretched & emulation \\
 \code{const} key slot: compiler deletes the gate loop & emulation of production image \\
-clock read once per poll: frame flood arms EN\_GATE past lease & code reading during the proof; proof after harness fix \\
+$^*$clock read once per poll: frame flood arms EN\_GATE past lease & code reading during the proof; proof after harness fix \\
 command forwarded after expiry, before the latch & inductive proof \\
 stored node id unchecked: undefined shift & inductive proof; UBSan \\
-32-bit challenge tag, no failure budget at authority & independent review \\
+$^*$32-bit challenge tag, no failure budget at authority & independent review \\
 first proof harness: time only moved at clock reads & surviving mutant \\
 \bottomrule
 \end{tabular}
 \caption{Defects in our own artifacts that affected the bound or the gate's integrity, and
-what found them. Five broke the timed bound itself.}
+what found them. The five marked $^*$ broke the timed bound itself. ``Independent review'' is a
+separate audit given only the code and a threat model.}
 \label{tab:bugs}
 \end{table}
 
 \paragraph{What each layer saw.} Table~\ref{tab:bugs} lists every defect we found that affected
 the bound or the gate's integrity; availability fixes (flash wear, a request that could cancel
-another controller's open challenge) are left out. The pattern matters more than the count. Each sits exactly where a layer abstracts: the Lean model has
+another controller's open challenge) are left out. The pattern matters more than the count. Most sit exactly where a layer abstracts: the Lean model has
 unbounded time, so it cannot see clock wrap; it lets the authority mint only for the current
 challenge, so it cannot see that a bare counter makes that rule unenforceable; the exploration's
 clock runs by fiat, so it cannot see a clock that stops with the CPU; and the exploration advances
@@ -435,6 +461,13 @@ the mutants against the full exploration are a separate, longer mode. The drive 
 plant. ``From $t_c + D$ on, the energized output depends on the agent in no way'' is, and it can
 be checked. Its three parts (energy, committed command, pending commands) fail independently.
 
+\paragraph{Budget the switch.} A Simplex decision module switches to the safe controller while the
+plant is still inside the safe controller's recoverable set. With a stateful drive, the AI's last
+setpoint can keep acting for up to $D = W + T + \delta$ after the switch. The switching condition
+must therefore hold for every state the plant can reach under the AI's last command within $D$,
+not only for the current state. A known $D$ turns ``revoke'' into a margin the shield can
+compute; an unknown one leaves no sound switching condition at all.
+
 \paragraph{Bind energy to provenance.} An energy interlock that follows the current authority's
 lease, the natural design for a safe-torque-off channel, is exactly what turns a late frame into
 a hijack. Energy must follow the authority of the setpoint actually being executed.
@@ -442,7 +475,7 @@ a hijack. Energy must follow the authority of the setpoint actually being execut
 \paragraph{Keep the enforcer below the policy.} The gate decides nothing about which controller
 should act; a shield, a Simplex decision module or an operator does. The gate makes that decision
 physically final within a bound, whatever the controllers do afterwards. It composes with any
-selection logic above it, and needs no change to the drive.
+selection logic above it, and needs no change to the drive's firmware, only its configuration.
 
 \paragraph{Check the monitor's code, under its clock.} Runtime assurance concentrates trust in a
 small monitor, which makes it worth checking at the level of its machine code and timers. Three of
@@ -465,14 +498,14 @@ trying.
 ends in software: commit-time checks at a protected sink
 \citep{santosgrueiro2026commit}, effect closure with impossibility certificates for providers
 with hidden state \citep{santosgrueiro2026closure}, and root-scoped quiescence with sink fences
-\citep{zhu2026revocation}. None treats physical persistence or gives a timing bound. An
+\citep{zhu2026revocation}. As far as we can tell from these preprints, none treats physical
+persistence or states an end-to-end timing bound. An
 excavator system \citep{heydari2026excavator} gives a revocation-to-stop latency, but with a
-trusted executor and actuator and without handover. \citet{das2026lastgate} states that a
-continuing effect needs continuing authority and proves a prevention theorem assuming the gate
-observes the pending output and checks atomically with it; his UAS draft \citep{das2026uas} has
-epoch-fenced handover and expiry-bounded exposure at the gate, and related drafts by the same
-author leave commands already buffered or applied downstream to the implementer. That is exactly our case: a gate that is
-\emph{not} atomic with the effect.
+trusted executor and actuator and without handover. As we read it, \citet{das2026lastgate}
+states that a continuing effect needs continuing authority and proves a prevention theorem
+assuming the gate observes the pending output and checks atomically with it; the same author's
+draft for uncrewed aircraft systems \citep{das2026uas} has epoch-fenced handover and
+expiry-bounded exposure at the gate. Our case is a gate that is \emph{not} atomic with the effect.
 
 \paragraph{Fencing and industrial safety.} Leases \citep{gray1989leases} bound how long a holder
 acts; Chubby's sequencers \citep{burrows2006chubby}, Raft terms \citep{ongaro2014raft} and
@@ -481,7 +514,7 @@ persists after acceptance or an energy path separate from the command path. PROF
 \citep{iec61784} has the device check sequence numbers and a watchdog, but with a fixed one-to-one
 host binding and no handover semantics; Safe Torque Off \citep{iec61800} removes energy without
 command provenance. Spot's lease service \citep{spotlease} rejects superseded commands on an
-integrated robot, without a published bound or treatment of persistent effort.
+integrated robot; we found no published bound or treatment of persistent effort for it.
 
 \section{Limitations}
 \label{sec:limits}
@@ -492,12 +525,22 @@ gate's share is statically about 25\,$\mu$s, but the drive's gate driver (TI DRV
 specified maximum turn-off delay. SIL emulates the CAN filter and tests no timing, bus-off or
 reset behaviour. \textbf{No refinement proof} connects the C code to the Lean model; the code is
 checked against the same property, by proof for the gate's timing and by bounded exploration for
-the drive side. \textbf{Message authentication is a draft}: one shared key, tags truncated to fit
+the drive side. The model also differs from the firmware: it rotates the node id over UART, where
+the firmware sends a CAN frame, flushes at boot, where the firmware stores the used ids, and lets
+every holder overlap, where the firmware makes overlap opt-in per token. These are covered by
+exploration only. \textbf{Readback checks the tag only.} The drive stores the tag and the torque
+in two writes, so a readback between them sees the new tag with the previous torque, for as long
+as the drive's command thread is preempted between two stores. Checking the torque as well closes
+this; the model and exploration treat a frame as one write and do not see it.
+\textbf{Message authentication is a draft}: one shared key, tags truncated to fit
 classic CAN. An independent review found the challenge-guessing bug in Table~\ref{tab:bugs} and
 leaves open a small per-hour probability of injecting one authentic-looking setpoint inside the
 bound (32-bit command tags; CAN FD would fix it) and an unspecified session-key channel. These
 affect integrity, not the time bound. \textbf{Scope}: one protected effect per gate; results apply
-to ODrive v3 firmware 0.5.x; liveness is shown as possibility, not under fairness.
+to ODrive v3 firmware 0.5.x in torque mode with passthrough input, since the tag needs a field
+the controller ignores, so position and velocity control are not covered; industrial drives
+(e.g. CiA~402 over EtherCAT) would need their own fence and tag; liveness is shown as
+possibility, not under fairness; we report no handover latency or availability figures.
 
 \section{Conclusion}
 
@@ -513,8 +556,8 @@ reproducing the hijack, and its absence, on a motor.
 As AAAI policy requires, we document the use of AI systems. An AI coding assistant (Claude, by
 Anthropic) was used throughout this work: to write and revise the gate code, test harnesses, Lean
 proofs and Python models, to run the experiments, to search related work, and to draft and edit
-this paper. Every theorem is checked by Lean, and every reported count comes from the scripts in
-the repository. The author reviewed the results and the text and is responsible for the entire
+this paper. Every theorem is checked by Lean, and every reported count except the static
+instruction count is produced by the scripts in the repository. The author reviewed the results and the text and is responsible for the entire
 content of the paper, including references.
 
 \bibliography{refs}

@@ -340,6 +340,11 @@ committed setpoint, not only its value.
     `input_vel_ = 0`, which never equals a tag.
   - **Readback must check tag *and* value.** The firmware writes `input_vel_` then
     `input_torque_` as two stores (`can_simple.cpp:282-283`); the value check closes that gap.
+    **Open (found by claim audit, 2026-11-22):** `gate_readback` checks only the tag
+    (`gate.h`, query `r axis0.controller.input_vel` in `gate_fw.c`). A readback between the two
+    stores confirms the session while the drive still holds the previous torque. The Lean model
+    and the exploration treat a frame as one write, so neither sees this. Fix: also query
+    `input_torque` after the tag and require the last forwarded value.
   - **SIL (real `can_simple.cpp` + real fibre `to_string`):**
     - R1: low-mantissa tags are unreadable.
     - R2a/R2b: a decimal tag works below 10 but is lost at |value| ≥ 100.
