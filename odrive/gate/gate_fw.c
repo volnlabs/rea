@@ -132,7 +132,10 @@ void gate_fw_poll(void) {
             break;
         }
     }
-    if (port_uart_line(line, sizeof line)) gate_readback(&g, line);
+    if (ok && port_uart_line(line, sizeof line)) {
+        gate_tick(&g, port_now());   // a re-sent setpoint, like a command, needs a live lease
+        if (gate_readback(&g, line, &out)) port_down_send(&out);
+    }
     // The one-shot runs for the time left from this read; nothing slow sits between them.
     now = port_now();
     port_en_gate(ok ? gate_enable_for(&g, now) : 0);

@@ -13,7 +13,7 @@ gate = os.path.join(here, "..", "gate")
 
 MUTANTS = [
     ("readback always confirms",
-     "g->holder >= 0 && strtof(tag_ascii, NULL) == (float)(g->node + 1);", "g->holder >= 0;"),
+     "g->confirmed = g->holder >= 0 && g->tag_b && t == gate_tag(g, true);", "g->confirmed = g->holder >= 0;"),
     ("node ids reused", "if (g->used & (1ull << id)) continue;", "if (id == g->node) continue;"),
     ("holder's lease never expires",
      "if (g->holder >= 0 && !g->lapsed && !gate_live(g->expiry, now)) { g->lapsed = true; g->expiry = 0; g->prev = -1; g->prev_expiry = 0; }", ""),
@@ -68,6 +68,10 @@ MUTANTS = [
      ["    uint32_t now = port_now(), c;", "        gate_tick(&g, now);", "    port_en_gate"], "gate_fw.c"),
     ("expiry not latched before a command", "        now = port_now();\n        gate_tick(&g, now);", "        now = port_now();", "gate_fw.c"),
     ("stored node id not range-checked", "ok = port_nv_load(&nv) && nv.node < 64;", "ok = port_nv_load(&nv);", "gate_fw.c"),
+    ("readback confirms on tag A (tag and torque taken as one write)",
+     "        g->tag_b = true;\n        return !g->confirmed && gate_forward(g, g->holder, g->tq, out);",
+     "        g->confirmed = true; g->prev = -1; g->prev_expiry = 0;\n        return false;"),
+    ("re-sent setpoint without latching expiry", "        gate_tick(&g, port_now());   // a re-sent setpoint, like a command, needs a live lease\n", "", "gate_fw.c"),
 ]
 
 # PROVE=1: judge each mutant by the CBMC proof (prove.sh) instead of the SIL run. JOBS: parallel mutants.

@@ -109,7 +109,15 @@ static void down(const gate_frame& f) {
     std::memcpy(m.buf, f.data, f.len);
     bus.inject(m);
 }
-static void readback(gate& g) { gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str()); }
+// One readback as the firmware does it: on tag A the gate re-sends the holder's last torque under
+// tag B, and the next readback can confirm.
+static void readback(gate& g) {
+    gate_frame f;
+    if (gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str(), &f)) {
+        down(f);
+        gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str(), &f);
+    }
+}
 
 static void x3() {
     enum { A = 0, B = 1, T = 100 };
@@ -433,6 +441,8 @@ static gate_nv p_nv;
 static uint32_t p_nv_writes, p_flushes;
 static bool p_abort_ok = true;
 static uint32_t p_frame_ms;   // clock advance while the gate handles one upstream frame (flood)
+static uint32_t p_line_ms;    // clock advance while the gate reads one UART line
+static uint32_t p_downs;      // frames sent downstream
 extern "C" {
 uint32_t port_now(void) { return p_now; }
 bool port_up_recv(gate_frame* f) {
@@ -443,10 +453,11 @@ bool port_up_recv(gate_frame* f) {
     return true;
 }
 void port_up_send(const gate_frame* f) { p_up_tx.push_back(*f); }
-void port_down_send(const gate_frame* f) { down(*f); }
+void port_down_send(const gate_frame* f) { down(*f); ++p_downs; }
 void port_uart_write(const char*) { p_line = ascii_read(axes[0].controller_.input_vel_); p_have_line = true; }
 bool port_uart_line(char* buf, int n) {
     if (!p_have_line) return false;
+    p_now += p_line_ms;
     std::snprintf(buf, n, "%s", p_line.c_str());
     p_have_line = false;
     return true;
@@ -630,6 +641,20 @@ static void firmware() {
     p_frame_ms = 0;
     fw_run(12);
     check(tq == 0.5f, "FW20 a command handled after the lease ran out, inside the same poll, is not forwarded");
+    fw_chal(&c);
+    fw_token(B, 0, c);                  // new session: rotation
+    cs.service_stack();
+    Ctl fb(B, c);
+    p_up.push_back(fb.cmd(0.7f));
+    gate_fw_poll();                     // forwarded under tag A and installed
+    p_line = ascii_read(axes[0].controller_.input_vel_);
+    p_have_line = true;
+    p_line_ms = T_MS + 50;              // the lease runs out while the gate reads the answer
+    uint32_t downs = p_downs;
+    gate_fw_poll();
+    p_line_ms = 0;
+    check(tq == 0.7f && p_downs == downs && !p_en,
+          "FW22 tag A read back after the lease ran out: nothing re-sent, EN_GATE low");
     p_nv.node = 64;
     gate_fw_init();
     check(!fw_chal(&c) && !p_en, "FW21 stored node id out of range (6 bits): gate stays disabled");
@@ -722,14 +747,14 @@ int main() {
           "R2b decimal tag lost at |value| >= 100: readback truncated to 9 characters");
 
     // R3: paired tag. SET_INPUT_VEL writes input_vel_ (tag) and input_torque_ (value) in one
-    // callback. Tag = session node id + 1. Session node id 9, tag 10.
+    // callback, as two stores (R5). Tag = session node id + 1. Session node id 9, tag 10.
     axes[0].config_.can.node_id = 9;
     cs.service_stack();
     float pair[2] = {10.0f, 0.37f};
     bus.inject(frame(9, 0x00D, pair, 8));
     std::string tag = ascii_read(axes[0].controller_.input_vel_);
     check(axes[0].controller_.input_torque_ == 0.37f && tag == "10.000000" && std::atof(tag.c_str()) == 10.0f,
-          "R3 SET_INPUT_VEL installs (tag, value) atomically; ASCII readback recovers tag 10 exactly");
+          "R3 SET_INPUT_VEL installs (tag, value) in one callback; ASCII readback recovers tag 10 exactly");
 
     // A stale frame from an earlier session (old id 7, tag 8) cannot overwrite the tag.
     float stale[2] = {8.0f, 0.99f};
@@ -745,7 +770,40 @@ int main() {
         if (std::atof(s.c_str()) != t) tags_ok = false;
         if (id > 0 && s == ascii_read(float(id))) tags_ok = false;
     }
-    check(tags_ok, "R4 all 64 tags (node id + 1) round-trip exactly through the 10-char ASCII readback");
+    for (int id = 0; id < 64 && tags_ok; ++id) {   // tag B = -(node id + 1)
+        float t = -float(id + 1);
+        if (std::atof(ascii_read(t).c_str()) != t || ascii_read(t) == ascii_read(-t)) tags_ok = false;
+    }
+    check(tags_ok, "R4 all 128 tags (A = node id + 1, B = -(node id + 1)) round-trip exactly through the 10-char ASCII readback");
+
+    // R5: the drive stores the tag, then the torque. A readback between the two stores sees the new
+    // tag with the previous author's torque; the gate must not confirm on it.
+    {
+        const uint64_t other = 1ull << axes[1].config_.can.node_id;
+        gate g;
+        gate_frame f, resend;
+        std::memset(&g, 0, sizeof g);
+        gate_boot(&g, axes[0].config_.can.node_id, other);
+        axes[0].controller_.input_torque_ = 0.99f;            // the previous author's setpoint
+        gate_grant(&g, 1, 0, 100, false, &f);
+        down(f);
+        cs.service_stack();
+        gate_forward(&g, 1, 0.37f, &f);
+        float sent[2];
+        std::memcpy(sent, f.data, 8);
+        axes[0].controller_.input_vel_ = sent[0];             // handler preempted after its first store
+        bool again = gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str(), &resend);
+        check(!g.confirmed && !gate_lease_ok(&g, 1) && axes[0].controller_.input_torque_ == 0.99f,
+              "R5a tag A seen before the torque store: not confirmed, EN_GATE stays low");
+        float b[2];
+        std::memcpy(b, resend.data, 8);
+        check(again && b[0] == -sent[0] && b[1] == 0.37f, "R5b the gate re-sends the holder's torque under tag B");
+        axes[0].controller_.input_torque_ = 0.37f;            // the first frame's handler resumes
+        down(resend);
+        gate_readback(&g, ascii_read(axes[0].controller_.input_vel_).c_str(), &resend);
+        check(g.confirmed && gate_lease_ok(&g, 1) && axes[0].controller_.input_torque_ == 0.37f,
+              "R5c tag B read back: confirmed, and the torque is the holder's");
+    }
 
     x3();
     mac_vectors();

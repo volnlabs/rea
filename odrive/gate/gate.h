@@ -54,7 +54,9 @@ typedef struct {
     int holder;         // origin id of the current grant, -1 = none
     uint8_t node;       // the drive's current node id (also stored non-volatile)
     uint32_t expiry;    // gate tick at which the holder's lease ends
-    bool confirmed;     // readback matched this session's tag
+    bool confirmed;     // readback showed this session's tag B (see gate_readback)
+    bool tag_b;         // readback showed tag A: frames now carry tag B
+    float tq;           // last torque forwarded this session (the holder's)
     bool lapsed;        // the holder's lease ran out; latched until its next grant
     int prev;           // previous holder whose lease still supports the output, -1 = none
     uint32_t prev_expiry;
@@ -81,8 +83,9 @@ static inline bool gate_live(uint32_t expiry, uint32_t now) { return (int32_t)(e
 // End the session. The dead session key and counters are wiped, not left behind.
 static inline void gate_drop(gate* g) {
     g->holder = g->prev = -1;
-    g->confirmed = g->lapsed = false;
+    g->confirmed = g->lapsed = g->tag_b = false;
     g->expiry = g->prev_expiry = g->seq = 0;
+    g->tq = 0;
     g->bad = 0;
     memset(g->ks, 0, sizeof g->ks);
 }
@@ -208,11 +211,16 @@ static inline int gate_token(gate* g, const uint8_t key[32], uint8_t origin, uin
 }
 
 // ---- Commands ----
-// A command from `origin`. Returns true when `out` must be sent downstream. The session tag
-// (node id + 1) and the value travel in one frame, so the drive installs both or neither.
-static inline bool gate_forward(const gate* g, int origin, float torque, gate_frame* out) {
+// A command from `origin`. Returns true when `out` must be sent downstream. The frame carries the
+// session tag in the velocity field and the value in the torque field. The drive stores them one
+// after the other (input_vel_, then input_torque_), so a readback can see a frame's tag before its
+// value. Each session therefore has two tags: A = node id + 1 until the drive has shown A, then
+// B = -(node id + 1). See gate_readback.
+static inline float gate_tag(const gate* g, bool b) { return b ? -(float)(g->node + 1) : (float)(g->node + 1); }
+static inline bool gate_forward(gate* g, int origin, float torque, gate_frame* out) {
     if (origin != g->holder || g->holder < 0 || g->lapsed) return false;
-    float pair[2] = {(float)(g->node + 1), torque};
+    g->tq = torque;
+    float pair[2] = {gate_tag(g, g->tag_b), torque};
     *out = gate_mk(g->node, GATE_CMD_SET_INPUT_VEL, pair, 8);
     return true;
 }
@@ -238,11 +246,24 @@ static inline bool gate_command(gate* g, const uint8_t d[8], gate_frame* out) {
 }
 
 // ---- Interlock ----
-// `tag_ascii` is the drive's answer to `r axis0.controller.input_vel` over UART. Once the new
-// session is confirmed the previous holder's lease no longer matters.
-static inline void gate_readback(gate* g, const char* tag_ascii) {
-    g->confirmed = g->holder >= 0 && strtof(tag_ascii, NULL) == (float)(g->node + 1);
+// `tag_ascii` is the drive's answer to `r axis0.controller.input_vel` over UART. Seeing tag A
+// proves an A frame was being handled before the answer; the drive finishes that frame's torque
+// store before it handles a later frame. B frames are sent only after that answer, so once the
+// drive shows B, its torque comes from this session's frames, however frames were delayed or
+// reordered and however late the answer is. Confirming on A alone would let a readback between
+// the two stores confirm while the drive still holds the previous author's torque. Until it is
+// confirmed, each A seen re-sends the holder's last torque under tag B (returns true: send
+// `out`), so a holder that sent one command is confirmed too. Expiry must be latched first.
+// Once the new session is confirmed the previous holder's lease no longer matters.
+static inline bool gate_readback(gate* g, const char* tag_ascii, gate_frame* out) {
+    float t = strtof(tag_ascii, NULL);
+    if (g->holder >= 0 && t == gate_tag(g, false)) {   // a late A keeps a confirmation
+        g->tag_b = true;
+        return !g->confirmed && gate_forward(g, g->holder, g->tq, out);
+    }
+    g->confirmed = g->holder >= 0 && g->tag_b && t == gate_tag(g, true);
     if (g->confirmed) { g->prev = -1; g->prev_expiry = 0; }
+    return false;
 }
 
 // Drives EN_GATE. False once the lease runs out, with no message needed.

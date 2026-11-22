@@ -51,7 +51,7 @@ that never hears of the revocation, and scales with the gate's clock rate under 
 gate's C firmware we prove the timing rules for unbounded runs with CBMC, and check the full
 property, including the drive side, by small-scope exhaustive exploration and by
 software-in-the-loop tests against the unmodified CAN code of an open-source drive (ODrive).
-These checks and an independent review found nine bugs in our own artifacts, most where a layer
+These checks and independent reviews found ten bugs in our own artifacts, most where a layer
 above abstracts. All evidence is software; $\delta$ and the motor are left to hardware work.
 \end{abstract}
 
@@ -104,7 +104,7 @@ checked in software-in-the-loop (SIL) on the drive's unmodified CAN code.
 \item \textbf{Evidence that reaches the firmware.} The gate's timing rules are proved on its C code
 with an inductive CBMC harness \citep{clarke2004cbmc}; the code is also explored exhaustively,
 at small bounds, against the full finality property, tested
-in SIL, mutation-checked, and run as an STM32F4 image in emulation. We report the nine bugs these
+in SIL, mutation-checked, and run as an STM32F4 image in emulation. We report the ten bugs these
 checks and review found in our own artifacts, and what found each.
 \end{itemize}
 
@@ -238,8 +238,13 @@ stale frame would pass. ODrive prints floats with at most six decimals into a te
 buffer, so a tag in the low mantissa bits is invisible. Instead the gate runs the drive in torque
 mode with passthrough input and sends every setpoint as \code{SET\_INPUT\_VEL} with the velocity
 field set to a session tag (node id $+\,1$) and the torque field set to the value. In this mode
-the velocity input is unused by the controller, so the tag is free. The gate checks the tag; the
-value travels in the same frame (but see Section~\ref{sec:limits}).
+the velocity input is unused by the controller, so the tag is free. The drive stores the tag and
+then the torque, so a readback can see a new tag while the previous author's torque is still in
+place. Each session therefore has two tags, $A$ (node id $+\,1$) and $B$ (its negative). Frames
+carry $A$ until the drive has shown $A$; the gate then re-sends the holder's last torque under $B$
+and confirms only on $B$. The drive handles one frame at a time, so the $A$ frame's torque is
+stored before any $B$ frame, which left the gate only after $A$ was seen; this holds however
+frames are reordered and however late the answer is.
 
 \paragraph{Energy.} EN\_GATE is not a pin level but a hardware one-shot timer, re-armed on every
 loop for the time left on the lease. A hung firmware loop cannot keep the output energized past
@@ -351,16 +356,16 @@ every $2^{31} - T$ ticks (\code{latch\_sound}).
 \section{From Model to Firmware}
 \label{sec:firmware}
 
-The gate is about 480 lines of C: a portable core (\code{gate.h}), a firmware loop
+The gate is about 510 lines of C: a portable core (\code{gate.h}), a firmware loop
 (\code{gate\_fw.c}) over a small board interface, and HMAC-SHA-256. It compiles for Cortex-M4
-and M0+ in 3.2--3.4\,kB, needing only \code{memcpy}, \code{memmove}, \code{memset},
+and M0+ in 3.5--3.6\,kB, needing only \code{memcpy}, \code{memmove}, \code{memset},
 \code{strtof} and compiler helpers.
 No refinement proof links it to the Lean model, so we check it directly against the finality
 property in four ways.
 
 \paragraph{SIL on unmodified drive code.} We compile ODrive's unmodified \code{can\_simple.cpp}
 \citep{odrive} with address and undefined-behaviour sanitizers against stubs for the members it
-touches, emulate the CAN filter in software, and link the gate firmware against it. About 95
+touches, emulate the CAN filter in software, and link the gate firmware against it. About 100
 checks cover the fence (frames to a stale id, for all 32 command ids, data and remote, change
 no drive state, including inside the window before the receive filter is renewed), the paired-tag readback
 (all 64 tags round-trip through the drive's own float printer), the hijack scenario with a
@@ -376,10 +381,10 @@ firmware hang). After every step it checks, for every origin (controller) $o$, I
 and setpoint authored by $o$
 $\Rightarrow$ now $<$ last mint for $o$ $+\,W + T$) and I2 (the author is the holder or, during a
 handover, the previous holder). Authorship is a ghost label the gate never sees. At $W{=}1$,
-$T{=}3$, five ticks, two origins and two frames in flight, I1 and I2 hold in all 72{,}065{,}308
+$T{=}3$, five ticks, two origins and two frames in flight, I1 and I2 hold in all 197{,}440{,}280
 reachable states of eight runs (no fault, each fault class, and a clock started just before the
-32-bit wrap), in 46{,}138{,}107 states of a configuration with two node ids that forces verified
-flushes, and in 226{,}244{,}970 states over all ten pairs of fault classes (pairs that include a
+32-bit wrap), in 100{,}044{,}895 states of a configuration with two node ids that forces verified
+flushes, and in 617{,}298{,}244 states over all ten pairs of fault classes (pairs that include a
 hang use a one-tick hang). Five million random steps at $W{=}3$, $T{=}6$, 60 ticks and three
 origins find nothing. Each configuration also counts states with EN\_GATE high, with a stale setpoint
 held while EN\_GATE is low, and with energy on the previous holder's lease (or, with two ids,
@@ -397,17 +402,18 @@ previous lease during a handover); \textbf{P2} a setpoint goes downstream only u
 \textbf{P3} a token is redeemed only for the challenge sent last, within $W$, and no challenge
 value is announced twice unless still open. With the authority's obligation (mint only for a
 tagged challenge, never after $t_c$), $i \le t_c$, so the gate's support ends by $t_c + W + T$.
-All 767 generated properties hold, including CBMC's bounds, pointer, division and shift checks.
+All 833 generated properties hold, including CBMC's bounds, pointer, division and shift checks.
 
-\paragraph{Mutation analysis and emulation.} 35 hand-written mutants each weaken one rule of the
+\paragraph{Mutation analysis and emulation.} 37 hand-written mutants each weaken one rule of the
 gate; every one fails at least one check \citep{jia2011mutation}. Run against the exploration
-alone, 20 of the first 32 break I1 or I2 (the last three were added with the proof and checked
-by it and the tests). Of the other twelve, most are availability, hardening or
+alone, 20 of the first 32 break I1 or I2; of the five added later (three with the proof, two
+with the two-tag readback), the exploration's random walks also find the one that confirms on
+tag $A$. Of the other twelve, most are availability, hardening or
 promptness rules; two need runs longer than the bounds and are caught by unit tests; and one,
 redeeming a token twice, we show is not needed for the bound, since every redemption falls within
-$W$ of the challenge. The proof alone kills 18 of the 35, every timing rule among them; it is
+$W$ of the challenge. The proof alone kills 19 of the 37, every timing rule among them; it is
 blind by design to drive-side and MAC rules. A register-level STM32F4 board
-layer, with no vendor library, links into a 5.9\,kB image that passes a 14-step sequence in
+layer, with no vendor library, links into a 6.1\,kB image that passes a 16-step sequence in
 Renode's STM32F4 model \citep{renode}, including EN\_GATE falling by the timer alone with the CPU
 halted. By manual static reading of the image, the path from the clock read to arming the
 one-shot has no loop: about 105
@@ -429,11 +435,12 @@ $^*$clock read once per poll: frame flood arms EN\_GATE past lease & code readin
 command forwarded after expiry, before the latch & inductive proof \\
 stored node id unchecked: undefined shift & inductive proof; UBSan \\
 $^*$32-bit challenge tag, no failure budget at authority & independent review \\
+$^*$readback confirmed on a tag stored before its torque & audit of paper against code; then exploration \\
 first proof harness: time only moved at clock reads & surviving mutant \\
 \bottomrule
 \end{tabular}
 \caption{Defects in our own artifacts that affected the bound or the gate's integrity, and
-what found them. The five marked $^*$ broke the timed bound itself. ``Independent review'' is a
+what found them. The six marked $^*$ broke the timed bound itself. ``Independent review'' is a
 separate audit given only the code and a threat model.}
 \label{tab:bugs}
 \end{table}
@@ -445,13 +452,15 @@ unbounded time, so it cannot see clock wrap; it lets the authority mint only for
 challenge, so it cannot see that a bare counter makes that rule unenforceable; the exploration's
 clock runs by fiat, so it cannot see a clock that stops with the CPU; and the exploration advances
 time only between steps, so it cannot see a stale clock inside one step. The proof harness had
-the same blind spot until a surviving mutant exposed it. For runtime assurance of AI controllers,
+the same blind spot until a surviving mutant exposed it. Both the model and the exploration
+treated a setpoint frame as one write, so neither could see a readback between the drive's two
+stores; a line-by-line audit of this paper's claims against the code found it. For runtime assurance of AI controllers,
 where the monitor is the only verified part, this argues for checking the monitor's actual code
 under its actual clock, not only its model.
 
 \paragraph{Reproducibility.} One script re-runs every Lean file, the SIL tests, the main
 exploration, the mutants against the tests, the CBMC proof, the Cortex-M builds and the emulation,
-in about 25 minutes on one workstation. The two-fault runs, the five-tick flush configuration and
+in about 70 minutes on one workstation. The two-fault runs, the five-tick flush configuration and
 the mutants against the full exploration are a separate, longer mode. The drive code is fetched at a pinned commit and left unmodified. Code, proofs and scripts: \url{https://github.com/volnlabs/rea}.
 
 \section{Implications for AI in the Factory}
@@ -479,7 +488,7 @@ selection logic above it, and needs no change to the drive's firmware, only its 
 
 \paragraph{Check the monitor's code, under its clock.} Runtime assurance concentrates trust in a
 small monitor, which makes it worth checking at the level of its machine code and timers. Three of
-the five bugs in Table~\ref{tab:bugs} that broke the bound lived in clock handling, which a
+the six bugs in Table~\ref{tab:bugs} that broke the bound lived in clock handling, which a
 timed model abstracts.
 
 \section{Related Work}
@@ -528,10 +537,8 @@ checked against the same property, by proof for the gate's timing and by bounded
 the drive side. The model also differs from the firmware: it rotates the node id over UART, where
 the firmware sends a CAN frame, flushes at boot, where the firmware stores the used ids, and lets
 every holder overlap, where the firmware makes overlap opt-in per token. These are covered by
-exploration only. \textbf{Readback checks the tag only.} The drive stores the tag and the torque
-in two writes, so a readback between them sees the new tag with the previous torque, for as long
-as the drive's command thread is preempted between two stores. Checking the torque as well closes
-this; the model and exploration treat a frame as one write and do not see it.
+exploration only. The two-tag readback rests on the drive handling one frame at a time, read from its source
+and checked in SIL and exploration, not in Lean.
 \textbf{Message authentication is a draft}: one shared key, tags truncated to fit
 classic CAN. An independent review found the challenge-guessing bug in Table~\ref{tab:bugs} and
 leaves open a small per-hour probability of injecting one authentic-looking setpoint inside the

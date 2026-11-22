@@ -338,19 +338,35 @@ committed setpoint, not only its value.
     ramp (`:194-198`).
   - **Why the tag is unique:** node ids are fresh since the last flush, and boot leaves
     `input_vel_ = 0`, which never equals a tag.
-  - **Readback must check tag *and* value.** The firmware writes `input_vel_` then
-    `input_torque_` as two stores (`can_simple.cpp:282-283`); the value check closes that gap.
-    **Open (found by claim audit, 2026-11-22):** `gate_readback` checks only the tag
-    (`gate.h`, query `r axis0.controller.input_vel` in `gate_fw.c`). A readback between the two
-    stores confirms the session while the drive still holds the previous torque. The Lean model
-    and the exploration treat a frame as one write, so neither sees this. Fix: also query
-    `input_torque` after the tag and require the last forwarded value.
+  - **Two tags per session, because a frame is two stores.** The drive writes `input_vel_`
+    then `input_torque_` (`can_simple.cpp:282-283`), so a readback can see a frame's tag while
+    the drive still holds the previous author's torque. The first gate confirmed on that tag
+    alone; a claim audit of the paper against the code found it (2026-11-22). The Lean model
+    treats a frame as one write and cannot express this; the exploration did too until it was
+    changed to deliver a setpoint in two steps.
+    - **Rule:** frames carry tag A = node id + 1 until the drive has shown A; then
+      B = -(node id + 1). Only B confirms. On each A seen while unconfirmed the gate re-sends the
+      holder's last torque under B, so a holder that sent one command is confirmed too.
+    - **Why B is enough (from the source, not proved):** the drive handles one CAN frame at a
+      time and finishes both stores of a frame before the next. Seeing A means an A frame had
+      been handled before the answer; B frames leave the gate only after that answer, so a B
+      tag in the drive means that A frame's torque store is done, and every later torque is this
+      session's. This holds with frames reordered or lost and with late UART answers, since only
+      the order "A observed, then B sent" matters.
+    - **A value check was rejected:** the drive prints torque with at most 6 decimals, so an old
+      torque close to the new one would pass, and answers to two different queries can be
+      misattributed when one is lost.
+    - **Checks:** SIL R5a-c (a readback between the two stores does not confirm; the re-send;
+      B confirms), FW22 (no re-send once the lease has run out), Renode S10a/S10b, the
+      exploration's two-step delivery, and mutants "readback confirms on tag A" (killed by R5 and
+      by the exploration alone) and "re-sent setpoint without latching expiry" (FW22).
   - **SIL (real `can_simple.cpp` + real fibre `to_string`):**
     - R1: low-mantissa tags are unreadable.
     - R2a/R2b: a decimal tag works below 10 but is lost at |value| ≥ 100.
     - R3/R3b: the paired tag round-trips; a stale old-session frame to an old id cannot
       overwrite it.
-    - R4: all 64 tags round-trip exactly through the 10-character readback.
+    - R4: all 128 tags (A and B for each node id) round-trip exactly through the 10-character
+      readback.
   - **Rejected alternatives:** low-mantissa tags (R1) and the decimal tag (a), which is
     magnitude-limited (R2b). A firmware session register (c) is unnecessary on 0.5.x.
 
@@ -552,7 +568,7 @@ SIL binary runs them against the ODrive code:
 
 | W1–W4 | 32-bit clock wrap: an ended lease, challenge or previous lease never comes back; a lease spanning the wrap runs its exact length |
 
-`odrive/sil/mutate.py` applies 35 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
+`odrive/sil/mutate.py` applies 37 mutants to `gate.h` and `gate_fw.c`; each fails at least one check.
 
 Differences from `FencedFinality.lean`:
 - overlap is opt-in per token (the model always overlaps from a confirmed holder);
@@ -635,13 +651,13 @@ for any origin with or without the overlap flag; a controller asking the authori
 for the next, not yet issued, challenge; any minted token presented at any time, any number of
 times; tokens with a made-up tag; next command, replayed command or bad-tag command
 under any session key ever handed out; downstream frames delivered in any order, after any delay,
-or lost; UART answers late, current or missing; and one fault class per run: gate reset (clock
+or lost, a setpoint stored as two steps (tag, then torque) with any readback in between; UART answers late, current or missing; and one fault class per run: gate reset (clock
 restarts), crash right after a storage write, failed storage write, drive reboot to its default
 node id, firmware hang (only the one-shot acts).
 
 | Mode | Bounds | Result |
 |---|---|---|
-| Exhaustive, duplicate states pruned | W=1, T=3, 5 ticks, 2 origins, 2 challenges, 2 tokens, 2 frames on the bus, 2 commands per key; no fault and each of the 5 fault classes; clock started at 0, and 4 ticks before the wrap for no fault and gate reset | I1 and I2 hold in all 72,065,308 states (8 runs, 7.5 minutes) |
+| Exhaustive, duplicate states pruned | W=1, T=3, 5 ticks, 2 origins, 2 challenges, 2 tokens, 2 frames on the bus, 2 commands per key; no fault and each of the 5 fault classes; clock started at 0, and 4 ticks before the wrap for no fault and gate reset | I1 and I2 hold in all 197,440,280 states (8 runs, about 30 minutes; 72,065,308 before setpoints were delivered as two stores) |
 | Seeded random walks | W=3, T=6, 60 ticks, 3 origins, 8 challenges, 12 tokens, 5,000,000 steps | I1 and I2 hold |
 
 The run is not vacuous: it reports how many states had EN_GATE high, how many of those rested on
@@ -668,8 +684,8 @@ flush). For exploration the gate is given two node ids, so the third token force
 
 | Mode | Bounds | Result |
 |---|---|---|
-| Exhaustive, flush configuration | 2 node ids, W=1, T=3, 5 ticks (4 in `check.sh`), 3 tokens, 3 challenges, 1 command per key, no overlap flag; no fault and each fault class | I1 and I2 hold in all 46,138,107 states, with 2,709,994 verified flushes |
-| Exhaustive, two fault classes per run | main configuration; all 10 pairs of the 5 fault classes | I1 and I2 hold in all 226,244,970 states (`EXPLORE=deep`, not part of `check.sh`; pairs with a firmware hang use a 1-tick hang, the reset + hang pair did not finish with 3) |
+| Exhaustive, flush configuration | 2 node ids, W=1, T=3, 5 ticks (4 in `check.sh`), 3 tokens, 3 challenges, 1 command per key, no overlap flag; no fault and each fault class | I1 and I2 hold in all 100,044,895 states, with 5,970,394 verified flushes (46,138,107 and 2,709,994 before two-store setpoints) |
+| Exhaustive, two fault classes per run | main configuration; all 10 pairs of the 5 fault classes | I1 and I2 hold in all 617,298,244 states (226,244,970 before two-store setpoints; 93 minutes, 4.2 GB; `EXPLORE=deep`, not part of `check.sh`; pairs with a firmware hang use a 1-tick hang, the reset + hang pair did not finish with 3) |
 
 The flush itself is taken as correct hardware (nothing left on the bus, drive back on its boot
 id with no setpoint, no stale UART answer). A flush that only claims this is
@@ -678,7 +694,7 @@ id with no setpoint, no stale UART answer). A flush that only claims this is
 **STM32F4 image, built and run in emulation (added 2026-11-13).** `../odrive/gate/stm32/` holds a
 register-level board layer for an STM32F4 (written for NUCLEO-F446RE), start-up code and a linker
 script. `build.sh` links a complete image with clang and lld, no vendor library and no libc
-(about 5.9 kB of code, 284 bytes of RAM). `renode_test.sh` runs that image in Renode's STM32F4
+(about 6.1 kB of code, 324 bytes of RAM). `renode_test.sh` runs that image in Renode's STM32F4
 model and drives one whole sequence over the emulated CAN controllers, UART, flash and timers,
 starting from the production image with the key written into flash as provisioning would:
 
@@ -687,11 +703,11 @@ starting from the production image with the key written into flash as provisioni
 | S1–S3 | boots, polls the drive over UART, EN_GATE one-shot stopped, stored state in flash |
 | S4–S5 | tagged challenge on the upstream bus; a token under the wrong key sends nothing downstream |
 | S6–S8 | valid token → rotation frame on the downstream bus and the new node id in flash; authenticated command forwarded with the session tag |
-| S9–S10 | EN_GATE stays off until the drive's UART answer matches; then the one-shot runs for the time left on the lease |
+| S9–S10 | EN_GATE stays off until the drive's UART answer matches; tag A alone does not enable, the gate re-sends the holder's torque under tag B (S10a), the holder's next command carries B (S10b); on B the one-shot runs for the time left on the lease |
 | S11–S12 | CPU halted for 300 ms: the timer stops by itself; the resumed firmware keeps EN_GATE off |
 | S13–S14 | after a reset the next challenge is above the earlier one, and the old token is dead |
 
-14/14 pass. **A finding from this run:** the first board layer counted milliseconds in a timer
+16/16 pass. **A finding from this run:** the first board layer counted milliseconds in a timer
 interrupt. With the CPU halted that clock stood still, so on resuming the gate still saw a live
 lease and would have re-armed EN_GATE for time that had already passed. The exploration's
 "firmware hangs" fault did not show this because its model clock keeps running by assumption.
@@ -796,7 +812,7 @@ The first version of the harness missed the first finding, because it advanced t
 firmware read the clock. The mutant "clock read once per poll" survived it. The harness was fixed
 so that real time also advances while a frame is handled.
 
-**Mutants against the proof alone** (`PROVE=1 mutate.py`): 18 of 35 killed. The proof kills every
+**Mutants against the proof alone** (`PROVE=1 mutate.py`): 19 of 37 killed (the two readback mutants added 2026-11-22: the re-send without a latch is killed by P2; confirming on tag A is drive side and survives, as expected). The proof kills every
 timing rule, and also "token for any challenge" and the storage rules for challenges. As expected,
 it does not kill:
 - drive-side rules (readback, node ids, flush order, rotation storage);

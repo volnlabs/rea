@@ -71,8 +71,16 @@ try:
 
     for ch in "2.000000\n": uart.WriteChar(ord(ch))
     run(10)
+    check(not en_running() and down_tx[-1:] == [((1 << 5) | 0x0D, struct.pack("<ff", -2.0, 0.25))],
+          "S10a drive shows tag A only: EN_GATE stays off, and the gate re-sends the holder's torque under tag B (-2)")
+    del down_tx[:]
+    up(0x030, torque + mac(ks, "C" + struct.pack("<I", 1) + torque)[:4])
+    run(5)
+    check(down_tx == [((1 << 5) | 0x0D, struct.pack("<ff", -2.0, 0.25))], "S10b next command carries tag B (-2)")
+    for ch in "-2.000000\n": uart.WriteChar(ord(ch))
+    run(10)
     left = word(0x4000002C) - word(0x40000024)
-    check(en_running() and 0 < left <= 200, "S10 readback matches: one-shot running, %d ms left (lease is 200 ms)" % left)
+    check(en_running() and 0 < left <= 200, "S10 readback shows tag B: one-shot running, %d ms left (lease is 200 ms)" % left)
 
     cpu.IsHalted = True            # the firmware hangs; only the timer can act now
     run(300)

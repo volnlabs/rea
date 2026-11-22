@@ -101,6 +101,8 @@ typedef struct {
     uint32_t wt, boot;
     gate_nv nv;
     uint8_t d_node; int8_t d_src; int32_t d_tag;
+    int8_t d_psrc; uint8_t d_half;       // a setpoint frame whose tag is stored, torque not yet (its author)
+    int8_t tq_src;                       // ghost: author of the last setpoint the gate forwarded
     flight fl[NFL]; uint8_t nfl;
     int32_t rb; uint8_t rb_have;
     uint8_t en; uint32_t en_until;       // EN_GATE and its hardware one-shot deadline (world time)
@@ -149,11 +151,13 @@ void port_up_send(const gate_frame* f) {
     if (w.n_future < w.n_issued) w.n_future = w.n_issued;
 }
 void port_down_send(const gate_frame* f) {
+    // A setpoint the gate sends on its own (re-sent after a readback) carries its last forwarded value.
+    if ((f->id & 0x1f) == GATE_CMD_SET_INPUT_VEL && cur_src >= 0) w.tq_src = (int8_t)cur_src;
     if (crashed) return;
     if (w.nfl == NFL) { overflow = true; return; }
     memset(&w.fl[w.nfl], 0, sizeof w.fl[0]);
     w.fl[w.nfl].f = *f;
-    w.fl[w.nfl].src = (int8_t)((f->id & 0x1f) == GATE_CMD_SET_INPUT_VEL ? cur_src : -1);
+    w.fl[w.nfl].src = (int8_t)((f->id & 0x1f) == GATE_CMD_SET_INPUT_VEL ? w.tq_src : -1);
     w.nfl++;
     // The bus is a multiset (any delivery order is explored), so keep it sorted: order is not state.
     for (int i = w.nfl - 1; i > 0 && memcmp(&w.fl[i - 1], &w.fl[i], sizeof w.fl[0]) > 0; --i) {
@@ -185,7 +189,7 @@ bool port_down_abort(void) {
 }
 bool port_drive_reset(void) {
     if (crashed) return false;
-    w.d_node = D0; w.d_tag = 0; w.d_src = -1;
+    w.d_node = D0; w.d_tag = 0; w.d_src = -1; w.d_half = 0; w.d_psrc = 0;
     w.rb = 0; w.rb_have = 0;
     n_flush++;
     return true;
@@ -348,7 +352,10 @@ static void explore(void) {
             TRY((up[nup++] = gate_raw(UP_TOKEN1, a, 6), up[nup++] = gate_raw(UP_TOKEN2, "forged!", 8)), "forged token presented (origin %d)", o, 0);
         }
     if (MAX_BADS && s.n_bad < MAX_BADS) TRY((w.n_bad++, up[nup++] = gate_raw(UP_CMD, "\1\2\3\4\5\6\7\0", 8), cur_src = 0), "command with a bad tag", 0, 0);
-    for (int i = 0; i < s.nfl; ++i) {
+    // The drive handles one frame at a time and stores a setpoint as two writes, tag (input_vel_)
+    // then torque (input_torque_): a readback may fall between them (can_simple.cpp:282-283).
+    if (s.d_half) TRY((w.d_src = s.d_psrc, w.d_half = 0, w.d_psrc = 0), "drive stores the torque of that frame", 0, 0);
+    for (int i = 0; i < s.nfl && !s.d_half; ++i) {
         const gate_frame f = s.fl[i].f;
         WEIGHT(12);
         uint32_t v;
@@ -358,7 +365,7 @@ static void explore(void) {
         TRY(({ drop_flight(i);
                if ((f.id >> 5) == s.d_node) {
                    if ((f.id & 0x1f) == GATE_CMD_SET_NODE_ID) { w.d_node = (uint8_t)v; n_rot++; }
-                   else { w.d_tag = (int32_t)tag; w.d_src = s.fl[i].src; }
+                   else { w.d_tag = (int32_t)tag; w.d_psrc = s.fl[i].src; w.d_half = 1; }
                } }), "downstream frame %d delivered (addressed to node %d)", i, (int)(f.id >> 5));
         WEIGHT(1);
         TRY(drop_flight(i), "downstream frame %d lost", i, 0);
@@ -375,7 +382,7 @@ static void explore(void) {
         if (can & F_RESET) TRY((w.fault_used |= F_RESET, reset_gate(), fw_save(), fw_load()), "gate reset", 0, 0);
         if (can & F_CRASH) TRY((w.fault_used |= F_CRASH, w.crash_armed = 1), "gate will crash right after its next storage write", 0, 0);
         if (can & F_STORE) TRY((w.fault_used |= F_STORE, w.fail_store = 1), "next storage write will fail", 0, 0);
-        if (can & F_DRIVE) TRY((w.fault_used |= F_DRIVE, w.d_node = D0, w.d_tag = 0, w.d_src = -1), "drive reboots", 0, 0);
+        if (can & F_DRIVE) TRY((w.fault_used |= F_DRIVE, w.d_node = D0, w.d_tag = 0, w.d_src = -1, w.d_half = 0, w.d_psrc = 0), "drive reboots", 0, 0);
     }
     if ((faults & F_STALL) && s.n_stall < MAX_STALL && s.wt < HORIZON)
         TRY((w.n_stall++, w.wt++, stalled = true), "firmware hangs for a tick -> %d (no poll)", (int)s.wt + 1, 0);
@@ -396,7 +403,7 @@ static void run(int fault_classes, uint32_t clock_base) {
     maxdepth = 0;
     memset(&w, 0, sizeof w);
     w.nv.node = D0;
-    w.d_node = D0; w.d_src = -1;
+    w.d_node = D0; w.d_src = -1; w.tq_src = -1;
     for (int o = 0; o < NORIG; ++o) w.lastmint[o] = NEVER;
     depth = 0;
     reset_gate();
@@ -417,7 +424,7 @@ static void walks(long steps) {
         base = rnd(2) ? 0xFFFFFFFFu - rnd(HORIZON) : 0;
         memset(&w, 0, sizeof w);
         w.nv.node = D0;
-        w.d_node = D0; w.d_src = -1;
+        w.d_node = D0; w.d_src = -1; w.tq_src = -1;
         for (int o = 0; o < NORIG; ++o) w.lastmint[o] = NEVER;
         depth = 0;
         reset_gate();
