@@ -22,13 +22,12 @@
 \newtheorem{definition}{Definition}
 
 \title{When the Shield Is Not the Actuator: Machine-Checked Revocation Bounds\\for AI Controllers of Stock Motor Drives}
-% TODO(authors): single-blind workshop review, so names go here.
 \author{
-    Author Name
+    Utkarsh Maurya
 }
 \affiliations{
-    Affiliation\\
-    email@example.com
+    VolnLabs\\
+    utkarsh@volnlabs.com
 }
 
 \begin{document}
@@ -427,7 +426,7 @@ under its actual clock, not only its model.
 \paragraph{Reproducibility.} One script re-runs every Lean file, the SIL tests, the main
 exploration, the mutants against the tests, the CBMC proof, the Cortex-M builds and the emulation,
 in about 25 minutes on one workstation. The two-fault runs, the five-tick flush configuration and
-the mutants against the full exploration are a separate, longer mode. The drive code is fetched at a pinned commit and left unmodified.
+the mutants against the full exploration are a separate, longer mode. The drive code is fetched at a pinned commit and left unmodified. Code, proofs and scripts: \url{https://github.com/volnlabs/rea}.
 
 \section{Implications for AI in the Factory}
 \label{sec:implications}
@@ -510,8 +509,13 @@ controller's influence by $t_c + W + T + \delta$, and that bound is machine-chec
 proved for the gate's timing on its C code, and explored on the drive side. The next step is the one the proofs cannot take: measuring $\delta$ and
 reproducing the hijack, and its absence, on a motor.
 
-% TODO(authors): artifact link. The repository is private; for single-blind review either make it
-% public, or add an anonymised archive, and cite it here.
+\section*{Use of AI Tools}
+As AAAI policy requires, we document the use of AI systems. An AI coding assistant (Claude, by
+Anthropic) was used throughout this work: to write and revise the gate code, test harnesses, Lean
+proofs and Python models, to run the experiments, to search related work, and to draft and edit
+this paper. Every theorem is checked by Lean, and every reported count comes from the scripts in
+the repository. The author reviewed the results and the text and is responsible for the entire
+content of the paper, including references.
 
 \bibliography{refs}
 

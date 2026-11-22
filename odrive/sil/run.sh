@@ -55,8 +55,9 @@ if [ "${EXPLORE:-full}" != quick ]; then
     -o "$out/explore_f" && "$out/explore_f" || rc=1
 fi
 # EXPLORE=deep adds every pair of fault classes in one run (10 runs, about 35 minutes, 2 GB).
+# A hang lasts one tick here: with three, the reset + hang pair does not finish.
 if [ "${EXPLORE:-full}" = deep ]; then
-  $ex -DFAULT_PAIRS -DHORIZON=5 -DGATE_W_MS=1u -DGATE_T_MS=3u -DNTOK=2 -DMAX_CHAL=2 -DMAX_BADS=0 -o "$out/explore_p" && "$out/explore_p" || rc=1
+  $ex -DFAULT_PAIRS -DMAX_STALL=1 -DHORIZON=5 -DGATE_W_MS=1u -DGATE_T_MS=3u -DNTOK=2 -DMAX_CHAL=2 -DMAX_BADS=0 -o "$out/explore_p" && "$out/explore_p" || rc=1
 fi
 $ex -DRANDOM_STEPS=${EXPLORE_STEPS:-5000000} -DHORIZON=60 -DGATE_W_MS=3u -DGATE_T_MS=6u -DNTOK=12 -DMAX_CHAL=8 -DMAX_BADS=4 -DNORIG=3 -DNODE_IDS=4 \
   -o "$out/explore_r" && "$out/explore_r" || rc=1
