@@ -48,8 +48,8 @@ delay, an energized output takes from the revoked controller neither its energy,
 committed setpoint, and every pending frame of that controller is fenced off from the drive. The
 bound holds in a Lean model with unbounded bus delay, a finite id space, gate resets, and a gate
 that never hears of the revocation, and scales with the gate's clock rate under drift. On the
-gate's C firmware we prove the timing rules for unbounded runs with CBMC, and check the full
-property, including the drive side, by small-scope exhaustive exploration and by
+gate's C firmware we prove the timing rules for unbounded runs with CBMC, and check energy and
+setpoint authorship, including the drive side, by small-scope exhaustive exploration and by
 software-in-the-loop tests against the unmodified CAN code of an open-source drive (ODrive).
 These checks and independent reviews found ten bugs in our own artifacts, most where a layer
 above abstracts. All evidence is software; $\delta$ and the motor are left to hardware work.
@@ -186,7 +186,7 @@ gate that forwards any origin (\code{no\_filter}) reaches a state past the deadl
 energized output and the revoked grant's setpoint; in the refined model with an explicit
 downstream stage, a gate without confirmed readback or without a check of frames in flight
 enables one grant while the drive holds, or may still commit, another grant's command
-(\code{reordered\_commit}, \code{lost\_command}). On the unmodified ODrive CAN code in SIL, the
+(\code{lost\_command}, \code{reordered\_commit}). On the unmodified ODrive CAN code in SIL, the
 drive installs both $A$'s persistent setpoint and $A$'s late frame, which an enable that follows
 $B$'s lease would energize. The same configuration can arise on industrial drives if a safety
 fieldbus such as PROFIsafe \citep{iec61784} fences the safe-torque-off channel while motion
@@ -368,7 +368,7 @@ property in four ways.
 touches, emulate the CAN filter in software, and link the gate firmware against it. About 100
 checks cover the fence (frames to a stale id, for all 32 command ids, data and remote, change
 no drive state, including inside the window before the receive filter is renewed), the paired-tag readback
-(all 64 tags round-trip through the drive's own float printer), the hijack scenario with a
+(all 128 tags, two per id, round-trip through the drive's own float printer), the hijack scenario with a
 power-only gate and with ours, token, command and handover rules, and the firmware loop end to end.
 
 \paragraph{Exhaustive exploration.} \code{explore.c} compiles the real \code{gate\_fw.c} into a
@@ -382,12 +382,12 @@ and setpoint authored by $o$
 $\Rightarrow$ now $<$ last mint for $o$ $+\,W + T$) and I2 (the author is the holder or, during a
 handover, the previous holder). Authorship is a ghost label the gate never sees. At $W{=}1$,
 $T{=}3$, five ticks, two origins and two frames in flight, I1 and I2 hold in all 197{,}440{,}280
-reachable states of eight runs (no fault, each fault class, and a clock started just before the
-32-bit wrap), in 100{,}044{,}895 states of a configuration with two node ids that forces verified
+reachable states of eight runs (no fault and each of the five fault classes, then no fault and
+gate reset again with the clock started just before the 32-bit wrap), in 100{,}044{,}895 states of a configuration with two node ids that forces verified
 flushes, and in 617{,}298{,}244 states over all ten pairs of fault classes (pairs that include a
 hang use a one-tick hang). Five million random steps at $W{=}3$, $T{=}6$, 60 ticks and three
 origins find nothing. Each configuration also counts states with EN\_GATE high, with a stale setpoint
-held while EN\_GATE is low, and with energy on the previous holder's lease (or, with two ids,
+held while EN\_GATE is low, and with energy on the previous holder's lease (or, with a reduced id pool,
 verified flushes), and fails if any count is zero, so the properties are not satisfied vacuously.
 
 \paragraph{Inductive proof.} The exploration is bounded. To cover unbounded runs we prove the
@@ -406,9 +406,9 @@ All 833 generated properties hold, including CBMC's bounds, pointer, division an
 
 \paragraph{Mutation analysis and emulation.} 37 hand-written mutants each weaken one rule of the
 gate; every one fails at least one check \citep{jia2011mutation}. Run against the exploration
-alone, 20 of the first 32 break I1 or I2; of the five added later (three with the proof, two
+alone (before the two-store change), 20 of the first 32 break I1 or I2; of the five added later (three with the proof, two
 with the two-tag readback), the exploration's random walks also find the one that confirms on
-tag $A$. Of the other twelve, most are availability, hardening or
+tag $A$. Of the twelve of the first 32 it misses, most are availability, hardening or
 promptness rules; two need runs longer than the bounds and are caught by unit tests; and one,
 redeeming a token twice, we show is not needed for the bound, since every redemption falls within
 $W$ of the challenge. The proof alone kills 19 of the 37, every timing rule among them; it is
@@ -428,7 +428,7 @@ which is the gate's share of $\delta$.
 Defect (all fixed) & Found by \\
 \midrule
 $^*$wrapped deadline test revives an ended lease & review; model cannot express \\
-$^*$bare-counter challenge: token for a future value outlives revocation & review; exploration gives a 19-step trace \\
+$^*$bare-counter challenge: token for a future value outlives revocation & review; exploration gives a 24-step trace \\
 $^*$interrupt-counted clock stops while CPU halted, lease stretched & emulation \\
 \code{const} key slot: compiler deletes the gate loop & emulation of production image \\
 $^*$clock read once per poll: frame flood arms EN\_GATE past lease & code reading during the proof; proof after harness fix \\
@@ -445,8 +445,8 @@ separate audit given only the code and a threat model.}
 \label{tab:bugs}
 \end{table}
 
-\paragraph{What each layer saw.} Table~\ref{tab:bugs} lists every defect we found that affected
-the bound or the gate's integrity; availability fixes (flash wear, a request that could cancel
+\paragraph{What each layer saw.} Table~\ref{tab:bugs} lists every fixed defect we found that affected
+the bound or the gate's integrity (open review findings are in Section~\ref{sec:limits}); availability fixes (flash wear, a request that could cancel
 another controller's open challenge) are left out. The pattern matters more than the count. Most sit exactly where a layer abstracts: the Lean model has
 unbounded time, so it cannot see clock wrap; it lets the authority mint only for the current
 challenge, so it cannot see that a bare counter makes that rule unenforceable; the exploration's
@@ -475,7 +475,9 @@ plant is still inside the safe controller's recoverable set. With a stateful dri
 setpoint can keep acting for up to $D = W + T + \delta$ after the switch. The switching condition
 must therefore hold for every state the plant can reach under the AI's last command within $D$,
 not only for the current state. A known $D$ turns ``revoke'' into a margin the shield can
-compute; an unknown one leaves no sound switching condition at all.
+compute; an unknown one leaves no sound switching condition at all. With our defaults and, say,
+$\delta = 10$\,ms, $D = 260$\,ms: a constant 1\,N\,m on an axis of inertia 0.01\,kg\,m$^2$
+from rest turns it by $\tau D^2/2J \approx 3.4$\,rad, which the switching condition must allow for.
 
 \paragraph{Bind energy to provenance.} An energy interlock that follows the current authority's
 lease, the natural design for a safe-torque-off channel, is exactly what turns a late frame into
@@ -494,7 +496,8 @@ timed model abstracts.
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{Runtime assurance for AI.} Shields \citep{alshiekh2018shield} and Simplex architectures
+\paragraph{Runtime assurance for AI.} Shields \citep{alshiekh2018shield}, verified runtime monitors
+\citep{mitsch2016modelplex,fulton2018saferl,bohrer2018veriphy} and Simplex architectures
 \citep{sha2001simplex,phan2020nsa} verify a monitor or a fallback controller instead of the
 learned controller. They assume the selected action is what the plant executes. Our setting is the
 one in which that assumption fails, because a stateful device sits between the switch and the
@@ -522,7 +525,9 @@ fencing tokens \citep{kleppmann2016locking} have the receiver reject stale epoch
 persists after acceptance or an energy path separate from the command path. PROFIsafe
 \citep{iec61784} has the device check sequence numbers and a watchdog, but with a fixed one-to-one
 host binding and no handover semantics; Safe Torque Off \citep{iec61800} removes energy without
-command provenance. Spot's lease service \citep{spotlease} rejects superseded commands on an
+command provenance. ODrive's own axis watchdog is fed by every frame the axis accepts
+\citep{odrive}, the new holder's included, so it ends a setpoint only when the bus falls silent.
+Spot's lease service \citep{spotlease} rejects superseded commands on an
 integrated robot; we found no published bound or treatment of persistent effort for it.
 
 \section{Limitations}
@@ -534,9 +539,10 @@ gate's share is statically about 25\,$\mu$s, but the drive's gate driver (TI DRV
 specified maximum turn-off delay. SIL emulates the CAN filter and tests no timing, bus-off or
 reset behaviour. \textbf{No refinement proof} connects the C code to the Lean model; the code is
 checked against the same property, by proof for the gate's timing and by bounded exploration for
-the drive side. The model also differs from the firmware: it rotates the node id over UART, where
-the firmware sends a CAN frame, flushes at boot, where the firmware stores the used ids, and lets
-every holder overlap, where the firmware makes overlap opt-in per token. These are covered by
+the drive side. The model also differs from the firmware: it commits a setpoint in one write, where the drive
+stores tag and torque separately; it rotates the node id over UART, where
+the firmware sends a CAN frame, flushes at boot, where the firmware stores the used ids, and always
+overlaps from a confirmed holder, where the firmware makes overlap opt-in per token. These are covered by
 exploration only. The two-tag readback rests on the drive handling one frame at a time, read from its source
 and checked in SIL and exploration, not in Lean.
 \textbf{Message authentication is a draft}: one shared key, tags truncated to fit
@@ -547,7 +553,13 @@ affect integrity, not the time bound. \textbf{Scope}: one protected effect per g
 to ODrive v3 firmware 0.5.x in torque mode with passthrough input, since the tag needs a field
 the controller ignores, so position and velocity control are not covered; industrial drives
 (e.g. CiA~402 over EtherCAT) would need their own fence and tag; liveness is shown as
-possibility, not under fairness; we report no handover latency or availability figures.
+possibility, not under fairness; we report no handover latency or availability figures. The theorem tracks one revoked grant
+per run. The bound starts at $t_c$, when the authority stops minting; the delay from a
+monitor's decision to the authority adds to it. The revoked controller keeps bus access and can
+contend for challenges or load the bus, which can delay a handover but not extend the bound;
+rate limits or a separate bus would address it. Energy off is safe only for an axis that may
+coast; a vertical or loaded axis needs a brake or a controlled stop such as SS1
+\citep{iec61800}.
 
 \section{Conclusion}
 

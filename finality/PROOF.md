@@ -620,7 +620,7 @@ got there, long after `t_c + W + T`. This broke assumption 3 above in our own co
 challenge frame carries the gate's tag (`gate_chal_mac`, 32 bits of HMAC under the shared key)
 and the authority mints only for a tagged challenge (`authority.py: verify_challenge`). No random
 number generator is needed. The exploration shows both sides: with an authority that skips the
-check it finds a 19-step I1 violation (run on every `run.sh` as an expected counterexample); with
+check it finds a 24-step I1 violation (19 before setpoints became two stores) (run on every `run.sh` as an expected counterexample); with
 the check, the same attack step is available to the adversary and never succeeds. A 32-bit tag
 can be guessed online with probability 2^-32 per attempt, so the authority must rate-limit
 requests; like the rest of the MAC scheme this is a draft.
